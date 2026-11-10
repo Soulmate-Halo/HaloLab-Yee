@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-d-recall"
+version = "1.2.0"
+description = "SGLang decode(D) side Recall speculative-draft accelerator"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "TensorFold" }]
+keywords = ["llm", "speculative-decoding", "recall", "sglang", "kv-cache", "dspark"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+torch = ["torch"]
+test = ["numpy"]
+
+[project.scripts]
+sglang-d-recall = "sglang_d_recall.__main__:main"
+
+[tool.setuptools]
+packages = ["sglang_d_recall", "sglang_d_recall.integrations"]
+include-package-data = true
