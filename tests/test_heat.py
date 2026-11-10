@@ -1,4 +1,4 @@
-"""Plain-assert tests for the heat eviction (hot zone) of sglang_d_recall.core. Run: python tests/test_heat.py
+"""Plain-assert tests for the heat eviction (hot zone) of yee.core. Run: python tests/test_heat.py
 
 Every test pins its own evict mode, so the result does not depend on RECALL_EVICT in the environment.
 Also collected by pytest (the test_* functions).
@@ -14,7 +14,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
-from sglang_d_recall import core as rc  # noqa: E402
+from yee import core as rc  # noqa: E402
 
 IDENT = {"tokenizer_digest": "b" * 64, "vocab_size": 129280, "model": "test"}
 RESULTS = []

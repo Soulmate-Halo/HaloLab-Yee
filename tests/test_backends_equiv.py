@@ -15,7 +15,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
-from sglang_d_recall import core as rc  # noqa: E402
+from yee import core as rc  # noqa: E402
 
 IDENT = {"tokenizer_digest": "e" * 64, "vocab_size": 129280, "model": "equiv"}
 TESTS = []

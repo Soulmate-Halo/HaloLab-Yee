@@ -21,3 +21,8 @@ LICENSE   text eol=lf
 *.gz     binary
 *.zip    binary
 *.tgz    binary
+
+# Patch payloads are sha256-pinned in yee/patches/MANIFEST.json: never convert line endings
+yee/patches/** -text
+*.patch -text
+*.zig -text

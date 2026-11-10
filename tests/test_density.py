@@ -1,4 +1,4 @@
-"""Plain-assert tests for the index density parameter of sglang_d_recall.core. Run: python tests/test_density.py
+"""Plain-assert tests for the index density parameter of yee.core. Run: python tests/test_density.py
 
 Every test pins its own density and evict mode, so the result does not depend on the environment.
 Also collected by pytest (the test_* functions).
@@ -12,7 +12,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
-from sglang_d_recall import core as rc  # noqa: E402
+from yee import core as rc  # noqa: E402
 
 IDENT = {"tokenizer_digest": "d" * 64, "vocab_size": 129280, "model": "density"}
 RESULTS = []

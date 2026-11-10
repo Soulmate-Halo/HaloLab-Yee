@@ -3,28 +3,29 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sglang-d-recall"
-version = "1.2.0"
-description = "SGLang decode(D) side Recall speculative-draft accelerator"
+name = "yee"
+version = "2.2.0"
+description = "Yee (formerly recall-accel): Recall copy-draft accelerator for SGLang (DSPARK/DFLASH/EAGLE/EAGLE3/MTP/STANDALONE/UNO/NGRAM), vLLM V2 (DSpark/DFlash/EAGLE/MTP), TensorFold, cuteafd and mlx-serve, with a built-in manual"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
-authors = [{ name = "TensorFold" }]
-keywords = ["llm", "speculative-decoding", "recall", "sglang", "kv-cache", "dspark"]
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "Intended Audience :: Developers",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
+keywords = ["llm", "speculative-decoding", "recall", "sglang", "vllm", "tensorfold", "cuteafd", "mlx-serve", "dspark", "dflash", "eagle", "mtp"]
 dependencies = ["numpy"]
 
 [project.optional-dependencies]
 torch = ["torch"]
-test = ["numpy"]
 
 [project.scripts]
-sglang-d-recall = "sglang_d_recall.__main__:main"
+yee = "yee.__main__:main"
+recall-accel = "yee.__main__:main"
 
 [tool.setuptools]
-packages = ["sglang_d_recall", "sglang_d_recall.integrations"]
+packages = ["yee", "yee.integrations", "yee.selftests", "recall_accel"]
 include-package-data = true
+
+[tool.setuptools.package-data]
+yee = ["docs/*.md", "patches/*", "patches/**/*"]
+
+[tool.pytest.ini_options]
+# the test files define a ``test(fn)`` decorator helper; only test_* functions are tests
+python_functions = ["test_*"]

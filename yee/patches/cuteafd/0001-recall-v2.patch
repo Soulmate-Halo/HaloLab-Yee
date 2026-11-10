@@ -1,0 +1,664 @@
+diff --git a/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/scheduler.rs b/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/scheduler.rs
+index 9ee10de..73f5a57 100644
+--- a/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/scheduler.rs
++++ b/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/scheduler.rs
+@@ -134,6 +134,8 @@ impl Active<'_> {
+ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut Requests<'a>,
+     prefixes: &mut PrefixCache<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
+     request.console_retire();
++    // Cross-request recall learns only from normally completed requests.
++    if request.cacheable && !request.failed { crate::shared::draft::recall::record(&request.tokens); }
+     let state = if !request.failed && requests.cache().request_id(request.lease).is_ok() {
+         requests.record_state(request.lease, &request.job.probe, "turn")
+     } else { Ok(()) };
+@@ -237,6 +239,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
+     mut prefixes: PrefixCache<'a>,
+ ) -> Result<()> {
+     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
++    crate::shared::draft::recall::init();
+     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
+     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
+     let mut id = 0u64;
+@@ -1333,9 +1336,14 @@ fn extend_inputs<'a, C: DraftChain<'a>>(draft: &mut DraftRuntime<'_, 'a, C>, act
+             .min(input.len() - 1 + crate::shared::draft::copy::COPY_EXTENSION);
+         if input.len() <= 1 { continue; }
+         let Some(calibrated) = draft.calibrated_confidence(members.len(), request.id(), input.len() - 1)? else { continue; };
+-        if let Some(copy) = crate::shared::draft::copy::continuation(&request.tokens, &input[1..], &calibrated,
++        if let Some((copy, recalled)) = crate::shared::draft::copy::sourced(&request.tokens, &input[1..], &calibrated,
+             room, request.job.sampling.is_greedy() && !crate::shared::probe::no_speculation(&request.job.probe)) {
+-            draft.extend_confidence(request.id(), copy.neural, copy.tokens.len() - copy.neural)?;
++            if recalled {
++                draft.extend_recalled_confidence(request.id(), copy.neural, copy.tokens.len() - copy.neural,
++                    crate::shared::draft::recall::prior())?;
++            } else {
++                draft.extend_confidence(request.id(), copy.neural, copy.tokens.len() - copy.neural)?;
++            }
+             input.truncate(1);
+             input.extend(copy.tokens);
+         }
+diff --git a/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/scheduler/independent.rs b/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/scheduler/independent.rs
+index 53d466d..c5d5fac 100644
+--- a/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/scheduler/independent.rs
++++ b/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/scheduler/independent.rs
+@@ -320,6 +320,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
+ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, requests: &RefCell<&mut Requests<'a>>,
+     prefixes: &RefCell<&mut PrefixCache<'a>>, draft: &RefCell<Option<&mut DraftRuntime<'_, 'a, C>>>) -> Result<()> {
+     request.console_retire();
++    // Cross-request recall learns only from normally completed requests.
++    if request.cacheable && !request.failed { crate::shared::draft::recall::record(&request.tokens); }
+     let state = if !request.failed && requests.borrow().cache().request_id(request.lease).is_ok() {
+         requests.borrow_mut().record_state(request.lease, &request.job.probe, "turn")
+     } else { Ok(()) };
+diff --git a/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/speculative.rs b/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/speculative.rs
+index 06daf7a..03e5a5f 100644
+--- a/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/speculative.rs
++++ b/rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/speculative.rs
+@@ -532,6 +532,20 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
+         Ok(())
+     }
+ 
++    /// A recalled continuation (`shared::draft::recall`): its neural prefix
++    /// agrees with an earlier request's tokens behind a 16-token anchor, so
++    /// every position, neural or copied, carries at least the recall prior.
++    pub fn extend_recalled_confidence(&mut self, id: u64, neural: usize, extra: usize, prior: f64) -> Result<()> {
++        let confidence = self.confidence_trace.get_mut(&id).context("missing neural draft confidence")?;
++        ensure!(neural <= confidence.len(), "neural confidence extent mismatch");
++        self.neural_lengths.insert(id, neural);
++        confidence.truncate(neural);
++        let floor = (prior / (1. - prior)).ln() as f32;
++        for logit in confidence.iter_mut() { *logit = logit.max(floor); }
++        confidence.extend(std::iter::repeat(floor).take(extra));
++        Ok(())
++    }
++
+     /// Each lane owns its draft scratch and stream; both can replay concurrently.
+     /// Short RefCell borrows never survive a scheduler yield.
+     pub fn poll_propose(&mut self, lane: usize,
+diff --git a/rust/crates/cuteafd-daemon/src/shared/draft.rs b/rust/crates/cuteafd-daemon/src/shared/draft.rs
+index 0b47e5b..61139ad 100644
+--- a/rust/crates/cuteafd-daemon/src/shared/draft.rs
++++ b/rust/crates/cuteafd-daemon/src/shared/draft.rs
+@@ -20,6 +20,7 @@ pub(crate) mod clock;
+ pub(crate) mod copy;
+ pub(crate) mod evidence;
+ pub(crate) mod probe;
++pub(crate) mod recall;
+ pub(crate) mod remote;
+ pub(crate) mod resource;
+ pub(crate) mod routes;
+diff --git a/rust/crates/cuteafd-daemon/src/shared/draft/copy.rs b/rust/crates/cuteafd-daemon/src/shared/draft/copy.rs
+index 8680af6..004a589 100644
+--- a/rust/crates/cuteafd-daemon/src/shared/draft/copy.rs
++++ b/rust/crates/cuteafd-daemon/src/shared/draft/copy.rs
+@@ -25,15 +25,39 @@ impl Continuation {
+     }
+ }
+ 
++#[cfg_attr(not(test), allow(dead_code))]
+ pub(crate) fn continuation(history: &[u32], drafted: &[u32], calibrated: &[f64], room: usize,
+     greedy: bool) -> Option<Continuation> {
++    sourced(history, drafted, calibrated, room, greedy).map(|(copy, _)| copy)
++}
++
++/// [`continuation`] and whether the copy was recalled from an earlier request
++/// ([`super::recall`]) instead of found in the request's own history.
++pub(crate) fn sourced(history: &[u32], drafted: &[u32], calibrated: &[f64], room: usize,
++    greedy: bool) -> Option<(Continuation, bool)> {
+     if !greedy || drafted.len() < MIN_DRAFT_AGREEMENT || calibrated.len() != drafted.len() { return None; }
+     let confident = calibrated.iter().take_while(|&&p| p.is_finite() && p >= CONFIDENCE_CUT).count();
+     let neural = confident.max(MIN_DRAFT_AGREEMENT);
+-    let (_, suffix, copy) = window(history, room.min(drafted.len() + COPY_EXTENSION));
++    let limit = room.min(drafted.len() + COPY_EXTENSION);
++    let (_, suffix, copy) = window(history, limit);
+     if suffix + neural < MIN_ANCHORED_MATCH || copy.len() <= neural
+-        || drafted[..neural] != copy[..neural] { return None; }
+-    Some(Continuation { tokens: copy.to_vec(), neural })
++        || drafted[..neural] != copy[..neural] {
++        return recalled(history, drafted, neural, limit).map(|copy| (copy, true));
++    }
++    Some((Continuation { tokens: copy.to_vec(), neural }, false))
++}
++
++/// The cross-request fallback when the request's own history has no
++/// qualifying copy: the same agreement rule applied to [`super::recall`]'s
++/// continuation, whose `RECALL_MATCH` token anchor exceeds
++/// `MIN_ANCHORED_MATCH`. While recall is off this is `None`, so
++/// [`sourced`] answers exactly as it did without recall.
++fn recalled(history: &[u32], drafted: &[u32], neural: usize, limit: usize) -> Option<Continuation> {
++    if !super::recall::enabled() { return None; }
++    let copy = super::recall::lookup(history, limit)?;
++    if copy.len() <= neural || drafted[..neural] != copy[..neural] { return None; }
++    super::recall::note_proposal(copy.len() - neural);
++    Some(Continuation { tokens: copy, neural })
+ }
+ 
+ /// Trace-only agreement with the same selected history copy, independent of room.
+diff --git a/rust/crates/cuteafd-daemon/src/shared/draft/recall.rs b/rust/crates/cuteafd-daemon/src/shared/draft/recall.rs
+new file mode 100644
+index 0000000..b5cd7c3
+--- /dev/null
++++ b/rust/crates/cuteafd-daemon/src/shared/draft/recall.rs
+@@ -0,0 +1,523 @@
++//! Cross-request history recall: copy drafts drawn from earlier requests.
++//!
++//! [`super::copy`] can only repeat a suffix the current request produced
++//! itself. Recall keeps a ring of the tokens of finished requests and, when
++//! the current history ends with a sequence a finished request contained,
++//! proposes the tokens that followed it there.
++//!
++//! The feature is switched at runtime. The control directory
++//! (`CUTEAFD_RECALL_DIR`, default `/run/cuteafd/bench/recall`) holds an
++//! `enabled` file whose presence turns recall on, an optional `capacity` file
++//! (token count) read when the ring is allocated, and a `clear.request` file
++//! that empties the ring. The same directory receives `stats.json` once per
++//! second. While recall is off the ring is not allocated, nothing is
++//! recorded and [`lookup`] answers `None` after one relaxed atomic load.
++//!
++//! A recalled continuation passes the same agreement rule as a local copy,
++//! but the draft-length policy sees every one of its positions at
++//! [`prior`] (an optional `prior` file, read every tick, overrides the
++//! default): the local copy's decaying tail prior would stop verification a
++//! few positions past the neural draft, where a recalled request usually
++//! still matches.
++
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
++use std::sync::{Mutex, Once, OnceLock, RwLock};
++use std::time::{Duration, Instant};
++
++/// Tokens a history and the stored stream must share.
++pub(crate) const RECALL_MATCH: usize = 16;
++/// The default ring capacity, in tokens (64 MiB of tokens, 256 MiB of index).
++const DEFAULT_CAPACITY: usize = 1 << 24;
++/// The smallest ring the operator may ask for.
++const MIN_CAPACITY: usize = 1 << 20;
++/// The largest ring the operator may ask for.
++const MAX_CAPACITY: usize = 1 << 27;
++/// Ends a recorded request inside the ring.
++const SEPARATOR: u32 = u32::MAX;
++/// Tokens written between two releases of the ring's write lock.
++const WRITE_CHUNK: usize = 8192;
++/// The control directory's environment override.
++const CONTROL_DIR: &str = "CUTEAFD_RECALL_DIR";
++/// The control directory's default.
++const DEFAULT_CONTROL_DIR: &str = "/run/cuteafd/bench/recall";
++/// How often the control thread reads the control files and writes the stats.
++const TICK: Duration = Duration::from_secs(1);
++/// The policy prior of a recalled position unless the `prior` file says otherwise.
++const DEFAULT_PRIOR: f64 = 0.98;
++/// The accepted range of the `prior` file.
++const PRIOR_RANGE: std::ops::RangeInclusive<f64> = 0.5..=0.999;
++
++static ENABLED: AtomicBool = AtomicBool::new(false);
++/// The `prior` file's value as `f64` bits; zero means [`DEFAULT_PRIOR`].
++static PRIOR_BITS: AtomicU64 = AtomicU64::new(0);
++static CAPACITY: AtomicU64 = AtomicU64::new(0);
++static LOOKUPS: AtomicU64 = AtomicU64::new(0);
++static HITS: AtomicU64 = AtomicU64::new(0);
++static BUSY: AtomicU64 = AtomicU64::new(0);
++static RECORDED_REQUESTS: AtomicU64 = AtomicU64::new(0);
++static RECORDED_TOKENS: AtomicU64 = AtomicU64::new(0);
++static PROPOSALS: AtomicU64 = AtomicU64::new(0);
++static PROPOSED_TOKENS: AtomicU64 = AtomicU64::new(0);
++static CLEARS: AtomicU64 = AtomicU64::new(0);
++static STORE: OnceLock<RwLock<Option<Store>>> = OnceLock::new();
++static SENDER: OnceLock<Mutex<Option<Sender<Vec<u32>>>>> = OnceLock::new();
++
++/// The recorded tokens and the index that finds them again.
++///
++/// The ring holds the tokens of every recorded request, each followed by
++/// [`SEPARATOR`]. A direct-mapped hash index points from a `RECALL_MATCH`
++/// long token sequence to the position that follows it, so a lookup is one
++/// hash, one slot read and one comparison instead of a scan. A later
++/// occurrence (or a colliding sequence) overwrites the slot, so the index
++/// answers with the latest occurrence it still remembers.
++pub(crate) struct Store {
++    /// The ring's capacity, in tokens.
++    capacity: usize,
++    /// The ring itself; global position `p` lives in slot `p % capacity`.
++    ring: Vec<u32>,
++    /// The next token lands at this global position.
++    write_pos: u64,
++    /// The direct-mapped index; a slot holds `next + 1`, where `next` is the
++    /// global position that follows the matched sequence (0 means empty).
++    index: Vec<u64>,
++    /// `index.len() - 1`.
++    mask: u64,
++    /// The trailing tokens of the request being written.
++    window: Vec<u32>,
++}
++
++impl Store {
++    /// A ring that holds `capacity` tokens.
++    pub(crate) fn new(capacity: usize) -> Self {
++        assert!(capacity > 2 * RECALL_MATCH, "recall ring must hold a full match and its continuation");
++        // Two slots per token keep the collisions of a busy ring rare.
++        let slots = (2 * capacity).next_power_of_two();
++        Self { capacity, ring: vec![0; capacity], write_pos: 0,
++            index: vec![0; slots], mask: (slots - 1) as u64, window: Vec::with_capacity(RECALL_MATCH + 1) }
++    }
++
++    /// Writes `tokens` as part of the request being recorded.
++    ///
++    /// The caller appends the [`SEPARATOR`] once the request is complete, so
++    /// a match never spans two requests.
++    pub(crate) fn append_tokens(&mut self, tokens: &[u32]) {
++        for &token in tokens {
++            let position = self.write_pos;
++            self.ring[(position % self.capacity as u64) as usize] = token;
++            if token == SEPARATOR {
++                // The separator ends the request: no match may span it.
++                self.window.clear();
++            } else {
++                self.window.push(token);
++                if self.window.len() > RECALL_MATCH { self.window.remove(0); }
++                if self.window.len() == RECALL_MATCH {
++                    // The match ends at `position`; its continuation starts at
++                    // `position + 1`, which the slot holds plus one.
++                    let hash = hash_tokens(&self.window);
++                    self.index[(hash & self.mask) as usize] = position + 2;
++                }
++            }
++            self.write_pos += 1;
++        }
++    }
++
++    /// Ends the request being recorded.
++    pub(crate) fn append_separator(&mut self) {
++        self.append_tokens(&[SEPARATOR]);
++    }
++
++    /// Records one request: its tokens followed by the separator.
++    #[cfg(test)]
++    pub(crate) fn append(&mut self, tokens: &[u32]) {
++        self.append_tokens(tokens);
++        self.append_separator();
++    }
++
++    /// Forgets every recorded request.
++    pub(crate) fn clear(&mut self) {
++        self.write_pos = 0;
++        self.index.fill(0);
++        self.window.clear();
++    }
++
++    /// The tokens the ring still holds.
++    pub(crate) fn stored_tokens(&self) -> u64 {
++        self.write_pos.min(self.capacity as u64)
++    }
++
++    /// The tokens that followed the remembered occurrence of the history's tail.
++    ///
++    /// The tail's `RECALL_MATCH` tokens are hashed into the index; the slot
++    /// that answers holds the position that follows them. The match is
++    /// compared token by token, so a hash collision or an overwritten ring
++    /// position cannot pass. The continuation stops at the request's
++    /// separator, at the write position, or after `limit` tokens.
++    pub(crate) fn lookup(&self, history: &[u32], limit: usize) -> Option<Vec<u32>> {
++        if history.len() < RECALL_MATCH || limit == 0 { return None; }
++        let tail = &history[history.len() - RECALL_MATCH..];
++        let slot = self.index[(hash_tokens(tail) & self.mask) as usize];
++        if slot == 0 { return None; }
++        // The slot holds the continuation's position plus one.
++        let next = slot - 1;
++        if next < RECALL_MATCH as u64 || next >= self.write_pos { return None; }
++        // The ring keeps positions `write_pos - capacity .. write_pos`; the
++        // match starts at `next - RECALL_MATCH`, which must still be resident.
++        if self.write_pos - next > (self.capacity - RECALL_MATCH) as u64 { return None; }
++        for (offset, &token) in tail.iter().enumerate() {
++            let position = next - RECALL_MATCH as u64 + offset as u64;
++            if self.ring[(position % self.capacity as u64) as usize] != token { return None; }
++        }
++        let mut tokens = Vec::with_capacity(limit.min(64));
++        let mut position = next;
++        while tokens.len() < limit && position < self.write_pos {
++            let token = self.ring[(position % self.capacity as u64) as usize];
++            if token == SEPARATOR { break; }
++            tokens.push(token);
++            position += 1;
++        }
++        if tokens.is_empty() { return None; }
++        Some(tokens)
++    }
++}
++
++/// Mixes a token sequence into a 64-bit hash whose low bits index the table.
++fn hash_tokens(tokens: &[u32]) -> u64 {
++    let mut hash = 0u64;
++    for &token in tokens {
++        hash = (hash.rotate_left(5) ^ u64::from(token)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
++    }
++    // A multiplicative hash mixes upward only; the finalizer brings the high
++    // bits down to the index bits.
++    hash ^= hash >> 33;
++    hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
++    hash ^= hash >> 33;
++    hash = hash.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
++    hash ^ (hash >> 33)
++}
++
++/// The global ring; it is allocated when recall is first enabled.
++fn store() -> &'static RwLock<Option<Store>> {
++    STORE.get_or_init(|| RwLock::new(None))
++}
++
++/// The channel that hands recorded requests to the control thread.
++fn sender() -> Option<Sender<Vec<u32>>> {
++    SENDER.get().and_then(|slot| slot.lock().ok().and_then(|slot| slot.as_ref().cloned()))
++}
++
++/// Whether recall is switched on.
++pub(crate) fn enabled() -> bool {
++    ENABLED.load(Ordering::Relaxed)
++}
++
++/// The draft-length policy's prior for every position of a recalled continuation.
++pub(crate) fn prior() -> f64 {
++    match PRIOR_BITS.load(Ordering::Relaxed) {
++        0 => DEFAULT_PRIOR,
++        bits => f64::from_bits(bits),
++    }
++}
++
++/// Counts a proposal the recall store produced and the tokens it carried.
++pub(crate) fn note_proposal(tokens: usize) {
++    PROPOSALS.fetch_add(1, Ordering::Relaxed);
++    PROPOSED_TOKENS.fetch_add(tokens as u64, Ordering::Relaxed);
++}
++
++/// Starts the control thread; calling it more than once has no effect.
++pub(crate) fn init() {
++    static INIT: Once = Once::new();
++    INIT.call_once(|| {
++        let directory = control_dir();
++        let (sender, receiver) = mpsc::channel::<Vec<u32>>();
++        if let Ok(mut slot) = SENDER.get_or_init(|| Mutex::new(None)).lock() { *slot = Some(sender); }
++        tracing::info!(directory = %directory.display(), "cross-request recall control thread starting");
++        let started = std::thread::Builder::new().name("cuteafd-recall".into())
++            .spawn(move || worker(directory, receiver));
++        if let Err(error) = started {
++            tracing::warn!(%error, "recall control thread did not start");
++        }
++    });
++}
++
++/// The control directory.
++fn control_dir() -> PathBuf {
++    let configured = std::env::var(CONTROL_DIR).unwrap_or_default();
++    if configured.trim().is_empty() { PathBuf::from(DEFAULT_CONTROL_DIR) }
++    else { PathBuf::from(configured) }
++}
++
++/// The tokens that followed the history's tail in an earlier request.
++///
++/// The lookup never blocks the decode: a busy ring answers with `None`.
++pub(crate) fn lookup(history: &[u32], limit: usize) -> Option<Vec<u32>> {
++    if !enabled() { return None; }
++    LOOKUPS.fetch_add(1, Ordering::Relaxed);
++    let Ok(guard) = store().try_read() else {
++        BUSY.fetch_add(1, Ordering::Relaxed);
++        return None;
++    };
++    let found = guard.as_ref()?.lookup(history, limit);
++    if found.is_some() { HITS.fetch_add(1, Ordering::Relaxed); }
++    found
++}
++
++/// Records a finished request's tokens for later requests to copy from.
++pub(crate) fn record(tokens: &[u32]) {
++    if !enabled() || tokens.len() < RECALL_MATCH { return; }
++    let Some(sender) = sender() else { return; };
++    // The control thread owns the ring; the decode path never waits for it.
++    let _ = sender.send(tokens.to_vec());
++}
++
++/// The control thread: applies the runtime switch once per tick, stores the
++/// recordings as they arrive and publishes the statistics file.
++fn worker(directory: PathBuf, receiver: Receiver<Vec<u32>>) {
++    let started = Instant::now();
++    let mut warned = false;
++    let mut next_tick = Instant::now();
++    loop {
++        if Instant::now() >= next_tick {
++            next_tick = Instant::now() + TICK;
++            control(&directory, &mut warned);
++            publish_stats(&directory, started);
++        }
++        match receiver.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
++            Ok(segment) => store_segment(&segment),
++            Err(RecvTimeoutError::Timeout) => {}
++            Err(RecvTimeoutError::Disconnected) => return,
++        }
++    }
++}
++
++/// Reads the control files: `enabled` switches the feature (the ring lives
++/// only while it is on) and `clear.request` empties the ring.
++fn control(directory: &Path, warned: &mut bool) {
++    if !directory.is_dir() {
++        if let Err(error) = std::fs::create_dir_all(directory) {
++            if !*warned {
++                *warned = true;
++                tracing::warn!(%error, directory = %directory.display(),
++                    "recall control directory is not available");
++            }
++            return;
++        }
++    }
++    let wanted = directory.join("enabled").is_file();
++    PRIOR_BITS.store(read_prior(directory).to_bits(), Ordering::Relaxed);
++    if wanted != enabled() {
++        if wanted {
++            let capacity = read_capacity(directory);
++            let mut guard = store().write().unwrap_or_else(|error| error.into_inner());
++            *guard = Some(Store::new(capacity));
++            drop(guard);
++            CAPACITY.store(capacity as u64, Ordering::Relaxed);
++            ENABLED.store(true, Ordering::Relaxed);
++            tracing::info!(capacity, "cross-request recall enabled");
++        } else {
++            ENABLED.store(false, Ordering::Relaxed);
++            let mut guard = store().write().unwrap_or_else(|error| error.into_inner());
++            *guard = None;
++            drop(guard);
++            CAPACITY.store(0, Ordering::Relaxed);
++            tracing::info!("cross-request recall disabled");
++        }
++    }
++    let clear_request = directory.join("clear.request");
++    if clear_request.is_file() {
++        {
++            let mut guard = store().write().unwrap_or_else(|error| error.into_inner());
++            if let Some(store) = guard.as_mut() { store.clear(); }
++        }
++        CLEARS.fetch_add(1, Ordering::Relaxed);
++        let _ = std::fs::remove_file(&clear_request);
++        tracing::info!("cross-request recall cleared");
++    }
++}
++
++/// Writes one recorded request into the ring, releasing the write lock every
++/// [`WRITE_CHUNK`] tokens so a lookup never waits behind a long write.
++fn store_segment(segment: &[u32]) {
++    let mut written = 0u64;
++    for chunk in segment.chunks(WRITE_CHUNK) {
++        let mut guard = store().write().unwrap_or_else(|error| error.into_inner());
++        let Some(store) = guard.as_mut() else { return; };
++        store.append_tokens(chunk);
++        written += chunk.len() as u64;
++    }
++    let mut guard = store().write().unwrap_or_else(|error| error.into_inner());
++    if let Some(store) = guard.as_mut() { store.append_separator(); }
++    drop(guard);
++    RECORDED_REQUESTS.fetch_add(1, Ordering::Relaxed);
++    RECORDED_TOKENS.fetch_add(written, Ordering::Relaxed);
++}
++
++/// Publishes the statistics file; a temporary file plus a rename keeps a
++/// reader from seeing a half written file.
++fn publish_stats(directory: &Path, started: Instant) {
++    let (stored, write_pos) = {
++        let guard = store().read().unwrap_or_else(|error| error.into_inner());
++        match guard.as_ref() {
++            Some(store) => (store.stored_tokens(), store.write_pos),
++            None => (0, 0),
++        }
++    };
++    let stats = serde_json::json!({
++        "enabled": enabled(),
++        "capacity": CAPACITY.load(Ordering::Relaxed),
++        "stored_tokens": stored,
++        "write_pos": write_pos,
++        "recorded_requests": RECORDED_REQUESTS.load(Ordering::Relaxed),
++        "recorded_tokens": RECORDED_TOKENS.load(Ordering::Relaxed),
++        "lookups": LOOKUPS.load(Ordering::Relaxed),
++        "hits": HITS.load(Ordering::Relaxed),
++        "busy": BUSY.load(Ordering::Relaxed),
++        "proposals": PROPOSALS.load(Ordering::Relaxed),
++        "proposed_tokens": PROPOSED_TOKENS.load(Ordering::Relaxed),
++        "clears": CLEARS.load(Ordering::Relaxed),
++        "prior": prior(),
++        "uptime_s": started.elapsed().as_secs(),
++    });
++    let temporary = directory.join("stats.json.tmp");
++    let published = directory.join("stats.json");
++    if let Ok(body) = serde_json::to_vec(&stats) {
++        if std::fs::write(&temporary, body).is_ok() {
++            let _ = std::fs::rename(&temporary, &published);
++        }
++    }
++}
++
++/// Reads the optional capacity file (a token count).
++fn read_capacity(directory: &Path) -> usize {
++    let path = directory.join("capacity");
++    let Ok(body) = std::fs::read_to_string(&path) else { return DEFAULT_CAPACITY; };
++    let Ok(value) = body.trim().parse::<u64>() else {
++        tracing::warn!(path = %path.display(), "unreadable recall capacity; using the default");
++        return DEFAULT_CAPACITY;
++    };
++    if value < MIN_CAPACITY as u64 || value > MAX_CAPACITY as u64 {
++        tracing::warn!(value, path = %path.display(), "recall capacity out of range; using the default");
++        return DEFAULT_CAPACITY;
++    }
++    value as usize
++}
++
++/// Reads the optional prior file; an absent, unreadable or out-of-range
++/// value means [`DEFAULT_PRIOR`].
++fn read_prior(directory: &Path) -> f64 {
++    std::fs::read_to_string(directory.join("prior")).ok()
++        .and_then(|body| body.trim().parse::<f64>().ok())
++        .filter(|value| PRIOR_RANGE.contains(value))
++        .unwrap_or(DEFAULT_PRIOR)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_written_match_returns_the_continuation() {
++        let mut store = Store::new(1024);
++        let first: Vec<u32> = (1..=40).collect();
++        let mut second: Vec<u32> = (100..=140).collect();
++        second[..RECALL_MATCH].copy_from_slice(&first[5..21]);
++        store.append(&first);
++        store.append(&second);
++        // The index keeps the latest occurrence, so the tail of the history
++        // answers with the tokens that followed the second occurrence.
++        let found = store.lookup(&second[..RECALL_MATCH], 32).expect("the match is found");
++        assert_eq!(found, second[RECALL_MATCH..].to_vec());
++        // A longer history only consults its last RECALL_MATCH tokens.
++        let mut history = vec![7, 7, 7];
++        history.extend_from_slice(&first[..21]);
++        assert_eq!(store.lookup(&history, 3), Some(second[RECALL_MATCH..RECALL_MATCH + 3].to_vec()));
++    }
++
++    #[test]
++    fn a_separator_truncates_the_continuation() {
++        let mut store = Store::new(1024);
++        let first: Vec<u32> = (1..=40).collect();
++        store.append(&first);
++        // A match that ends the request has nothing after it.
++        assert!(store.lookup(&first[24..40], 32).is_none());
++        // A match inside the request stops at the separator.
++        let found = store.lookup(&first[5..21], 64).expect("the match is found");
++        assert_eq!(found, first[21..40].to_vec());
++        // No match spans the separator into the next request.
++        let second: Vec<u32> = (200..240).collect();
++        store.append(&second);
++        let mut spanning = first[32..40].to_vec();
++        spanning.extend_from_slice(&second[..8]);
++        assert!(store.lookup(&spanning, 8).is_none());
++    }
++
++    #[test]
++    fn a_different_tail_does_not_match() {
++        let mut store = Store::new(1024);
++        let first: Vec<u32> = (1..=40).collect();
++        store.append(&first);
++        let mut tail = first[5..21].to_vec();
++        tail[7] += 1000;
++        assert!(store.lookup(&tail, 32).is_none());
++        assert!(store.lookup(&first[..8], 32).is_none());
++    }
++
++    #[test]
++    fn an_overwritten_match_is_forgotten() {
++        let mut store = Store::new(64);
++        let first: Vec<u32> = (1..=40).collect();
++        store.append(&first);
++        assert!(store.lookup(&first[5..21], 32).is_some());
++        // The filler wraps the ring and overwrites the first request.
++        store.append(&(1000..1200).collect::<Vec<u32>>());
++        assert!(store.lookup(&first[5..21], 32).is_none());
++        assert_eq!(store.stored_tokens(), 64);
++    }
++
++    #[test]
++    fn the_limit_truncates_the_continuation() {
++        let mut store = Store::new(1024);
++        let first: Vec<u32> = (1..=60).collect();
++        store.append(&first);
++        let found = store.lookup(&first[..RECALL_MATCH], 5).expect("the match is found");
++        assert_eq!(found, first[RECALL_MATCH..RECALL_MATCH + 5].to_vec());
++        assert!(store.lookup(&first[..RECALL_MATCH], 0).is_none());
++        assert!(store.lookup(&first[..RECALL_MATCH - 1], 5).is_none());
++    }
++
++    #[test]
++    fn a_clear_forgets_everything() {
++        let mut store = Store::new(1024);
++        let first: Vec<u32> = (1..=60).collect();
++        store.append(&first);
++        store.clear();
++        assert_eq!(store.stored_tokens(), 0);
++        assert!(store.lookup(&first[..RECALL_MATCH], 5).is_none());
++        store.append(&first);
++        assert!(store.lookup(&first[..RECALL_MATCH], 5).is_some());
++    }
++
++    #[test]
++    fn the_global_switch_starts_off() {
++        // Nothing enables recall without the control thread and its file.
++        assert!(!enabled());
++        assert!(lookup(&[1; RECALL_MATCH], 4).is_none());
++        record(&[1; 64]);
++        assert_eq!(prior(), DEFAULT_PRIOR);
++    }
++
++    #[test]
++    fn the_prior_file_is_validated() {
++        let directory = std::env::temp_dir().join(format!("cuteafd-recall-prior-{}", std::process::id()));
++        std::fs::create_dir_all(&directory).unwrap();
++        assert_eq!(read_prior(&directory), DEFAULT_PRIOR);
++        for (body, expected) in [("0.9\n", 0.9), ("0.999", 0.999), ("1.5", DEFAULT_PRIOR), ("0.2", DEFAULT_PRIOR),
++            ("NaN", DEFAULT_PRIOR), ("high", DEFAULT_PRIOR)] {
++            std::fs::write(directory.join("prior"), body).unwrap();
++            assert_eq!(read_prior(&directory), expected, "prior file {body:?}");
++        }
++        std::fs::remove_dir_all(&directory).unwrap();
++    }
++}

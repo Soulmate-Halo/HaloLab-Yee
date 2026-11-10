@@ -1,0 +1,151 @@
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index a9af579..ddd34de 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -108,6 +108,8 @@ pub const Config = struct {
+     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
+     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
+     lone_copies: bool = true, // Model.lone_copies
++    /// TF_RECALL_AFTER_PRICED=1: a priced proposer's none (DSv4.1's TF_DSV41_LOOKUP_PLAN, Llama's drafter) asks Recall
++    recall_after_priced: bool = false,
+     k: Constants = .{},
+ 
+     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
+@@ -189,9 +191,18 @@ pub const Config = struct {
+             },
+             .draft_step_ms = m.draft_step_ms,
+             .shared_drafts = m.shared_drafts,
++            .recall_after_priced = recallAfterPriced(),
+         };
+     }
+ 
++    /// TF_RECALL_AFTER_PRICED: "1", "true", "yes" or "on" turns it on; unset or anything else leaves it off.
++    fn recallAfterPriced() bool {
++        const v = std.c.getenv("TF_RECALL_AFTER_PRICED") orelse return false;
++        const t = std.mem.trim(u8, std.mem.span(v), " \t");
++        for ([_][]const u8{ "1", "true", "yes", "on" }) |on| if (std.ascii.eqlIgnoreCase(t, on)) return true;
++        return false;
++    }
++
+     pub fn deinit(c: *Config, gpa: Allocator) void {
+         gpa.free(c.depth_prior);
+         c.family_costs.deinit(gpa);
+diff --git a/zig/src/core/lanes/recall_engine_test.zig b/zig/src/core/lanes/recall_engine_test.zig
+index 0fb9456..81b462b 100644
+--- a/zig/src/core/lanes/recall_engine_test.zig
++++ b/zig/src/core/lanes/recall_engine_test.zig
+@@ -14,7 +14,7 @@ const gpa = std.testing.allocator;
+ 
+ const Case = struct { prompt: []const u32, max_new: u32 = 120, sampling: ?Sampling = null, drafts: bool = true };
+ 
+-const Opts = struct { lone_copies: bool = true, fill_lanes: u32 = 0, own_copies: bool = true, copies: bool = true };
++const Opts = struct { lone_copies: bool = true, fill_lanes: u32 = 0, own_copies: bool = true, copies: bool = true, priced_none: bool = false, after_priced: bool = false };
+ 
+ const Out = struct {
+     emitted: [][]u32,
+@@ -56,6 +56,8 @@ fn model(o: Opts) !Config {
+ fn run(cases: []const Case, shared: ?*recall.Shared, o: Opts) !Out {
+     var cfg = try model(o);
+     defer cfg.deinit(gpa);
++    cfg.recall_after_priced = o.after_priced;
++    var none: Stub = .{ .out = &.{}, .priced = true }; // o.priced_none: every stream's proposer a priced one that drafts nothing
+     var target: fake.Fake = .{ .gpa = gpa, .ranked = o.fill_lanes > 0 };
+     defer target.deinit();
+     var clock: fake.FixedClock = .{};
+@@ -77,7 +79,7 @@ fn run(cases: []const Case, shared: ?*recall.Shared, o: Opts) !Out {
+             .eos = &.{96},
+             .sampling = c.sampling,
+             .drafts = c.drafts,
+-            .proposer = if (o.own_copies) p.proposer() else null,
++            .proposer = if (o.priced_none) none.proposer() else if (o.own_copies) p.proposer() else null,
+             .recall = if (shared != null) r else null,
+         });
+     }
+@@ -246,8 +248,14 @@ const Stub = struct {
+ 
+ /// A shared round's copy for a stream of `p` drafting with `stub`, a record continuing `p` (tokens gpa-owned).
+ fn copyWith(stub: *Stub, shared: *recall.Shared, p: []const u32) !win.Copy {
++    return copyWithAfter(stub, shared, p, false);
++}
++
++/// copyWith with Config.recall_after_priced set as `after` (TF_RECALL_AFTER_PRICED).
++fn copyWithAfter(stub: *Stub, shared: *recall.Shared, p: []const u32, after: bool) !win.Copy {
+     var cfg = try model(.{});
+     defer cfg.deinit(gpa);
++    cfg.recall_after_priced = after;
+     var target: fake.Fake = .{ .gpa = gpa };
+     defer target.deinit();
+     var clock: fake.FixedClock = .{};
+@@ -283,3 +291,46 @@ test "a priced proposer's copy is taken as it gives it, and its none stands: no
+     try std.testing.expect(!kept_one.recalled);
+     try std.testing.expectEqualSlices(u32, one.out, kept_one.tokens);
+ }
++
++test "recall_after_priced: a priced proposer's none takes Recall's copy, its own drafts still stand as given" {
++    const p = prompt(40, 5);
++    const plain = try run(&.{.{ .prompt = &p, .drafts = false }}, null, .{});
++    defer plain.deinit();
++    var shared = try newShared();
++    defer shared.record.deinit();
++    try remember(&shared, &p, plain.emitted[0]);
++    var none: Stub = .{ .out = &.{}, .priced = true };
++    const recalled = try copyWithAfter(&none, &shared, &p, true);
++    defer gpa.free(recalled.tokens);
++    try std.testing.expect(recalled.recalled and recalled.tokens.len >= 2); // the none asks the record
++    try std.testing.expectEqualSlices(u32, plain.emitted[0][0..recalled.tokens.len], recalled.tokens); // the reply's own ids
++    var one: Stub = .{ .out = &.{plain.emitted[0][0]}, .priced = true };
++    const kept_one = try copyWithAfter(&one, &shared, &p, true);
++    defer gpa.free(kept_one.tokens);
++    try std.testing.expect(!kept_one.recalled); // a priced draft wins over the record
++    try std.testing.expectEqualSlices(u32, one.out, kept_one.tokens);
++    var empty = try newShared();
++    defer empty.record.deinit();
++    const nothing = try copyWithAfter(&none, &empty, &p, true);
++    defer gpa.free(nothing.tokens);
++    try std.testing.expect(!nothing.recalled and nothing.tokens.len == 0); // an empty record: the none stands
++}
++
++test "recall_after_priced in the round loop: a priced drafter's repeat copies from the record, same tokens greedy and sampled" {
++    const p = prompt(40, 7);
++    for ([_]?Sampling{ null, .{ .seed = 99, .temperature = 0.8 }, .{ .seed = 5, .temperature = 1.0, .top_k = 0, .top_p = 1.0 } }) |sampling| {
++        const plain = try run(&.{.{ .prompt = &p, .sampling = sampling, .drafts = false }}, null, .{});
++        defer plain.deinit();
++        var shared = try newShared();
++        defer shared.record.deinit();
++        try remember(&shared, &p, plain.emitted[0]);
++        const off = try run(&.{.{ .prompt = &p, .sampling = sampling }}, &shared, .{ .priced_none = true });
++        defer off.deinit();
++        try std.testing.expectEqualSlices(u32, plain.emitted[0], off.emitted[0]);
++        try std.testing.expectEqual(@as(u64, 0), off.proposals); // upstream: a priced none leaves the record alone
++        const on = try run(&.{.{ .prompt = &p, .sampling = sampling }}, &shared, .{ .priced_none = true, .after_priced = true });
++        defer on.deinit();
++        try std.testing.expectEqualSlices(u32, plain.emitted[0], on.emitted[0]);
++        try std.testing.expect(on.accepted > 0 and on.rounds < off.rounds);
++    }
++}
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index 47c9c82..60c59a3 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -205,11 +205,16 @@ pub fn copyProposal(e: *Engine, s: *Stream) !Copy {
+     const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
+     const most = @min(@as(i64, width), s.draftRoom() - 1);
+     if (s.proposer) |p| if (!e.alone or e.cfg.lone_copies) {
+-        // a priced proposer's drafts are as it gives them, its none too: no width, length or match gate, no Recall
+-        if (p.vtable.priced) return .{ .tokens = p.propose(s.context.items, @min(@as(i64, e.cfg.max_copy), s.draftRoom() - 1)) catch &.{} };
+-        const copied = p.proposeAfter(s.context.items, &.{}, most) catch &.{};
+-        const least: usize = if (e.alone and e.cfg.context_copies) 1 else 2;
+-        if (copied.len >= least and p.lastMatch() >= e.cfg.enter_match) return .{ .tokens = copied };
++        // a priced proposer's drafts are as it gives them: no width, length or match gate; its none stands too,
++        // unless cfg.recall_after_priced (TF_RECALL_AFTER_PRICED=1), where a none asks Recall's record below
++        if (p.vtable.priced) {
++            const given = p.propose(s.context.items, @min(@as(i64, e.cfg.max_copy), s.draftRoom() - 1)) catch &.{};
++            if (given.len > 0 or !e.cfg.recall_after_priced) return .{ .tokens = given };
++        } else {
++            const copied = p.proposeAfter(s.context.items, &.{}, most) catch &.{};
++            const least: usize = if (e.alone and e.cfg.context_copies) 1 else 2;
++            if (copied.len >= least and p.lastMatch() >= e.cfg.enter_match) return .{ .tokens = copied };
++        }
+     };
+     const r = s.recall orelse return .{};
+     if (most < 2) return .{};

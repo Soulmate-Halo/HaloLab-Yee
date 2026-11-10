@@ -1,0 +1,69 @@
+{
+ "format": 1,
+ "package": "yee 2.2.0",
+ "bases": {
+  "tensorfold": {
+   "file": "tensorfold/0001-recall-after-priced.patch",
+   "sha256": "121e01158b5ab5bb4e91d61bc90c7f1ec555d4de9edf16c8248216e7471387be",
+   "kind": "git-patch",
+   "baseline": "ashhart/TensorFold commit 33ada77c3122fca844a6825316ce8bbabaca05be",
+   "apply_in": "repository root (git apply)",
+   "env": {
+    "TF_RECALL_AFTER_PRICED": "1"
+   },
+   "rebuild": "zig build with the repository's .zig-version (0.17.0 at the baseline)",
+   "summary": "priced proposers (DSv4.1 lookup plan, Llama drafter, Qwen4 device lanes) that offer no draft fall back to Recall when TF_RECALL_AFTER_PRICED=1; unset = upstream behaviour"
+  },
+  "cuteafd": {
+   "kind": "git-patch",
+   "baseline": "cuteafd revision 9f53cc6cc0f3ff56de7cb81d587b3fad77137f4c",
+   "apply_in": "source root (patch -p1 or git apply)",
+   "default_variant": "v2",
+   "variants": {
+    "v1": {
+     "file": "cuteafd/0001-recall-v1.patch",
+     "sha256": "543b3f20b3ad1c8acd5e3e307a6b7758419d66494ef0048652abee8f753bddc1"
+    },
+    "v2": {
+     "file": "cuteafd/0001-recall-v2.patch",
+     "sha256": "1cc56fb8023408d8aa05cb499f255481e70a69ff6accb99ea34317fa71cfad96"
+    }
+   },
+   "notes": {
+    "file": "cuteafd/NOTES-s839y-r572.md",
+    "sha256": "463d5218c634b2bf9b75e9e87b6bb536cb8b1affffb1f68ca15605f68feb5e07"
+   },
+   "env": {},
+   "summary": "DeepSeek V4.1 native serve: Recall copy drafts, greedy only, record in process memory"
+  },
+  "mlx-serve": {
+   "kind": "source-drop",
+   "baseline": "M5 xypd mlx-serve source (2026-11-10 r593)",
+   "target": "src/engines/mlx/spec",
+   "files": [
+    {
+     "file": "mlx-serve/files/src/engines/mlx/spec/d_recall.zig",
+     "sha256": "5f9ca62a6dd484c15db0713448653717ed4e390742f27f093da340a4ff1e6941",
+     "dest": "src/engines/mlx/spec/d_recall.zig"
+    },
+    {
+     "file": "mlx-serve/files/src/engines/mlx/spec/d_recall_live.zig",
+     "sha256": "e3c68c4785128a660e333fee163f415e45ee80f617ef664b483262d93005ae34",
+     "dest": "src/engines/mlx/spec/d_recall_live.zig"
+    },
+    {
+     "file": "mlx-serve/files/src/engines/mlx/spec/dspark.zig",
+     "sha256": "63942469656d42fdcb6d2f912c7eeb0debe6f6b501fa2b56acad6fe7b5b632bf",
+     "dest": "src/engines/mlx/spec/dspark.zig"
+    },
+    {
+     "file": "mlx-serve/files/src/engines/mlx/spec/dspark_group.zig",
+     "sha256": "d379c6a05e2f02033776929c4ed4e46b2946415e9f4465f2b99152dfb965a9cc",
+     "dest": "src/engines/mlx/spec/dspark_group.zig"
+    }
+   ],
+   "env": {},
+   "summary": "DSpark Recall for greedy and sampled requests, 8/4-token short-window fallback; rebuild mlx-serve after the copy"
+  }
+ }
+}
