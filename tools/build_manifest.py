@@ -177,6 +177,20 @@ def main() -> int:
                         "flock and refreshes every 2 s, STRATA_RECALL_SHARED=0 = the 3.5.x single writer) and a "
                         "two-process unit test tests/yee_recall_shared_test.cpp",
             ),
+            "maya-recall": dict(
+                item("maya-recall/0001-maya-yee-recall.patch"),
+                kind="git-patch",
+                apply_tool="patch",
+                baseline="Project Maya v1.1.66 source tree (patch -p1 in the source root)",
+                apply_in="source root (patch -p1)",
+                notes=item("maya-recall/NOTES-r56.md"),
+                env={"RECALL_ACCEL": "1"},
+                rebuild="cmake --build build --target maya",
+                summary="Yee recall inside Project Maya's multi-slot scheduler (--parallel N>1): the recalled copies "
+                        "are proposed in the MTP verification window, the C++ part is the same as strata-recall, and "
+                        "concurrency above MAYA_GLM_MULTI_MTP_MAX only records (no drafts); "
+                        "RECALL_ACCEL=1, unset = upstream",
+            ),
             "llama.cpp-mtp-vocab": dict(
                 item("llama.cpp-mtp-vocab/0001-yee-mtp-vocab.patch"),
                 kind="git-patch",

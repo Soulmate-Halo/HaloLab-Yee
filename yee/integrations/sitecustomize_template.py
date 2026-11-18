@@ -124,3 +124,11 @@ if _on("YEE_EXPERT_BUDGET"):
         expert_budget.install()
     except Exception as _e:  # noqa: BLE001
         print("[yee-eb] install failed: %r" % (_e,), flush=True)
+
+# 4.3: what Yee does for this launch command and which parameters to change (YEE_NOTICE=0: quiet)
+try:
+    from yee.integrations import plan as _plan
+
+    _plan.print_startup()
+except Exception:  # noqa: BLE001
+    pass

@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import sys
 
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 _TRUE = ("1", "true", "yes", "on")
 _FALSE = ("0", "false", "no", "off")
 MASTER = ("YEE", "RECALL_ACCEL", "SGLANG_D_RECALL", "VLLM_D_RECALL", "DSV41_RECALL")

@@ -51,7 +51,7 @@ def test_compat_same_modules():
               "assert a is b\n"
               "assert sys.modules['recall_accel.integrations.sglang_dspark'] is "
               "sys.modules['yee.integrations.sglang_dspark']\n"
-              "assert recall_accel is yee and recall_accel.__version__ == '4.2.0'\n"
+              "assert recall_accel is yee and recall_accel.__version__ == '4.3.0'\n"
               "from recall_accel.core import RecallEngine\n"
               "import yee.core\n"
               "assert RecallEngine is yee.core.RecallEngine\n"
@@ -88,7 +88,7 @@ def test_yee_env_alias():
 @test
 def test_manifest_sha256():
     m = patches.load_manifest()
-    assert set(m["bases"]) == {"tensorfold", "cuteafd", "mlx-serve", "mlx-serve-2.4", "tensorfold-kad", "llama.cpp-kad", "mlx-serve-kad", "llama.cpp-recall", "mia-dsv41-vcap", "mia-dsv41-image-budget", "strata-recall", "llama.cpp-mtp-vocab"}, sorted(m["bases"])
+    assert set(m["bases"]) == {"tensorfold", "cuteafd", "mlx-serve", "mlx-serve-2.4", "tensorfold-kad", "llama.cpp-kad", "mlx-serve-kad", "llama.cpp-recall", "mia-dsv41-vcap", "mia-dsv41-image-budget", "strata-recall", "llama.cpp-mtp-vocab", "maya-recall"}, sorted(m["bases"])
     seen = set()
     for name, e in m["bases"].items():
         files = []

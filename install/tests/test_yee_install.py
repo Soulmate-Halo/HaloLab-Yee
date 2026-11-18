@@ -23,7 +23,7 @@ need_bash = pytest.mark.skipif(not LINUX_BASH, reason="needs Linux bash")
 ORIG = "/root/.cache/xy_yee31:/opt/dsv41/adapter:/opt/b12x"
 
 
-def make_wheel(d, version="4.2.0"):
+def make_wheel(d, version="4.3.0"):
     p = os.path.join(d, "yee-%s-py3-none-any.whl" % version)
     with zipfile.ZipFile(p, "w") as z:
         z.writestr("yee/__init__.py", "__version__ = %r\n" % version)
@@ -42,22 +42,22 @@ def test_split_extra_last_wins_first_line_only():
 
 
 def test_new_pythonpath_strips_old_yee_dirs():
-    assert yi.new_pythonpath(ORIG, "yee42") == "/root/.cache/yee42:/opt/dsv41/adapter:/opt/b12x"
-    assert yi.new_pythonpath("/root/.cache/yee41/:/root/.cache/yee42:/x", "yee42") == "/root/.cache/yee42:/x"
-    assert yi.new_pythonpath("", "yee42") == "/root/.cache/yee42"
-    once = yi.new_pythonpath(ORIG, "yee42")
-    assert yi.new_pythonpath(once, "yee42") == once
+    assert yi.new_pythonpath(ORIG, "yee43") == "/root/.cache/yee43:/opt/dsv41/adapter:/opt/b12x"
+    assert yi.new_pythonpath("/root/.cache/yee42/:/root/.cache/yee43:/x", "yee43") == "/root/.cache/yee43:/x"
+    assert yi.new_pythonpath("", "yee43") == "/root/.cache/yee43"
+    once = yi.new_pythonpath(ORIG, "yee43")
+    assert yi.new_pythonpath(once, "yee43") == once
 
 
 def test_blocks_roundtrip_and_single():
     base = "A=1\nEXTRA_CONTAINER_ENV=\"X=1\"\n"
-    one = yi.with_block(base, "4.2.0", "/root/.cache/yee42:/opt")
-    two = yi.with_block(one, "4.2.0", "/root/.cache/yee42:/opt")
-    assert two.count("# >>> yee 4.2.0 (install.sh) >>>") == 1
-    assert "PYTHONPATH=/root/.cache/yee42:/opt YEE=1" in two
+    one = yi.with_block(base, "4.3.0", "/root/.cache/yee43:/opt")
+    two = yi.with_block(one, "4.3.0", "/root/.cache/yee43:/opt")
+    assert two.count("# >>> yee 4.3.0 (install.sh) >>>") == 1
+    assert "PYTHONPATH=/root/.cache/yee43:/opt YEE=1" in two
     assert yi.strip_blocks(two) == base
-    other = yi.with_block(one, "4.3.0", "/root/.cache/yee43")
-    assert "yee 4.2.0" not in other and other.count(">>> yee") == 1
+    other = yi.with_block(one, "4.4.0", "/root/.cache/yee44")
+    assert "yee 4.3.0" not in other and other.count(">>> yee") == 1
 
 
 def test_worker_hosts_rules():
@@ -68,14 +68,14 @@ def test_worker_hosts_rules():
 
 
 def test_dir_name_and_mask():
-    assert yi.dir_name_for("4.2.0") == "yee42"
+    assert yi.dir_name_for("4.3.0") == "yee43"
     assert yi.dir_name_for("10.12.3") == "yee1012"
     assert yi.mask("API_KEY", "s") == "<已隐藏>" and yi.mask("YEE_P", "0.9") == "0.9"
 
 
 def test_wheel_stage(tmp_path):
     w = yi.Wheel(make_wheel(str(tmp_path)))
-    assert w.version == "4.2.0" and set(w.vcap) == {"verify_cap.py", "vcap_policy.py"}
+    assert w.version == "4.3.0" and set(w.vcap) == {"verify_cap.py", "vcap_policy.py"}
     d1, d2 = tmp_path / "s1", tmp_path / "s2"
     d1.mkdir()
     d2.mkdir()
@@ -227,7 +227,7 @@ def world(tmp_path, monkeypatch):
         d.mkdir()
         homes[h] = str(d)
     logs = tmp_path / "docker.log"
-    logs.write_text("[yee] 4.2.0 defaults: RECALL_ACCEL=1\n[recall] patched x\n[recall] rank check on: 4 ranks\n"
+    logs.write_text("[yee] 4.3.0 defaults: RECALL_ACCEL=1\n[recall] patched x\n[recall] rank check on: 4 ranks\n"
                     "[recall] steps=10 rows=10\n[recall] steps=99 rows=120\n")
     monkeypatch.setenv("FAKE_DOCKER_LOGS", str(logs))
     monkeypatch.setenv("FAKE_VCAP_SHA", yi.VCAP_ORIG_SHA256)
@@ -271,7 +271,7 @@ def test_check_is_read_only(world, capsys):
     rc = yi.main(["--recipe", str(r), "--wheel", world["whl"], "--check"], runner=world["runner"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "安装后容器 PYTHONPATH：/root/.cache/yee42:/opt/dsv41/adapter:/opt/b12x" in out
+    assert "安装后容器 PYTHONPATH：/root/.cache/yee43:/opt/dsv41/adapter:/opt/b12x" in out
     assert "放，每台镜像里的 verify_cap.py 都与补丁所基于的原件一致" in out
     assert "RECALL_ACCEL_GIB=0.5" in out and "YEE=0" in out
     assert (r / ".env.tp4").read_bytes() == before
@@ -284,27 +284,27 @@ def test_install_all_hosts_then_uninstall(world):
     env = str(r / ".env.tp4")
     assert yi.main(["--recipe", str(r), "--wheel", world["whl"], "--yes"], runner=world["runner"]) == 0
     for home in [str(world["head"])] + list(world["homes"].values()):
-        base = os.path.join(home, ".cache", "yee42")
+        base = os.path.join(home, ".cache", "yee43")
         assert os.path.isfile(os.path.join(base, "sitecustomize.py"))
         assert os.path.isfile(os.path.join(base, "verify_cap.py"))
         assert os.path.isfile(os.path.join(base, "yee", "__init__.py"))
-    assert sourced(env, "PYTHONPATH") == "/root/.cache/yee42:/opt/dsv41/adapter:/opt/b12x"
+    assert sourced(env, "PYTHONPATH") == "/root/.cache/yee43:/opt/dsv41/adapter:/opt/b12x"
     assert sourced(env, "YEE") == "1" and sourced(env, "A") == "1"
     ctl = r / "state-tp4" / "vcap_ctl.json"
     assert ctl.read_text().strip() == '{"mode": "adapt"}'
     # 再装一次：仍只有一个标记块，保留一份旧目录
     assert yi.main(["--recipe", str(r), "--wheel", world["whl"], "--yes"], runner=world["runner"]) == 0
     text = open(env).read()
-    assert text.count(">>> yee 4.2.0") == 1
-    olds = [n for n in os.listdir(os.path.join(str(world["head"]), ".cache")) if n.startswith("yee42.old-")]
+    assert text.count(">>> yee 4.3.0") == 1
+    olds = [n for n in os.listdir(os.path.join(str(world["head"]), ".cache")) if n.startswith("yee43.old-")]
     assert len(olds) == 1
     assert yi.main(["--recipe", str(r), "--wheel", world["whl"], "--yes", "--uninstall", "--purge"],
                    runner=world["runner"]) == 0
     assert ">>> yee" not in open(env).read()
     assert sourced(env, "PYTHONPATH") == ORIG and sourced(env, "YEE") == "0"
     assert not ctl.exists() and not (r / "state-tp4" / "vcap_ctl.json.yee-install").exists()
-    assert not os.path.exists(os.path.join(str(world["head"]), ".cache", "yee42"))
-    assert not os.path.exists(os.path.join(world["homes"]["w1"], ".cache", "yee42"))
+    assert not os.path.exists(os.path.join(str(world["head"]), ".cache", "yee43"))
+    assert not os.path.exists(os.path.join(world["homes"]["w1"], ".cache", "yee43"))
 
 
 @need_bash
@@ -313,7 +313,7 @@ def test_no_vcap_when_image_differs(world, monkeypatch, capsys):
     r = world["recipe"]()
     assert yi.main(["--recipe", str(r), "--wheel", world["whl"], "--yes"], runner=world["runner"]) == 0
     assert "不放，head 镜像里的 verify_cap.py 与补丁原件不同" in capsys.readouterr().out
-    assert not os.path.exists(os.path.join(str(world["head"]), ".cache", "yee42", "verify_cap.py"))
+    assert not os.path.exists(os.path.join(str(world["head"]), ".cache", "yee43", "verify_cap.py"))
     assert not (r / "state-tp4" / "vcap_ctl.json").exists()
 
 
@@ -326,7 +326,7 @@ def test_override_mode_never_writes_state(world):
     root = world["tmp"] / "override"
     assert yi.main(["--recipe", str(r), "--env-file", str(copy), "--cache-root-override", str(root),
                     "--wheel", world["whl"], "--yes"], runner=world["runner"]) == 0
-    assert (root / "yee42" / "sitecustomize.py").exists()
+    assert (root / "yee43" / "sitecustomize.py").exists()
     assert (r / ".env.tp4").read_bytes() == before and ">>> yee" in copy.read_text()
     assert not (r / "state-tp4").exists()
 
@@ -345,7 +345,7 @@ def test_restart_success(world, capsys):
 
 @need_bash
 def test_restart_inactive_reports_code_2(world, capsys):
-    world["logs"].write_text("[yee] 4.2.0 defaults: RECALL_ACCEL=1\n"
+    world["logs"].write_text("[yee] 4.3.0 defaults: RECALL_ACCEL=1\n"
                              "[recall] rank check off: missing ranks [1, 2, 3]; copies stay off on every rank\n")
     r = world["recipe"]()
     rc = yi.main(["--recipe", str(r), "--wheel", world["whl"], "--yes", "--restart", "--timeout-min", "2"],

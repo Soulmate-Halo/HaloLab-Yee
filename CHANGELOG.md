@@ -1,6 +1,18 @@
 # 变更记录
 
-本文件按版本倒序记录模块的变更。仓库首发版本为 sglang-d-recall 1.2.0（tag `v1.2.0`），2.2.0 起发行包改名为 `yee`，当前版本 4.2.0（tag `v4.2.0`）。
+本文件按版本倒序记录模块的变更。仓库首发版本为 sglang-d-recall 1.2.0（tag `v1.2.0`），2.2.0 起发行包改名为 `yee`，当前版本 4.3.0（tag `v4.3.0`）。
+
+## 4.3.0（Yee）
+
+新增部署诊断：装上以后能直接看出每个实例能不能加速、要改什么。详细说明见 `yee/docs/changelog.md` 与 `yee/docs/deploy.md`。
+
+- 新增 `python -m yee doctor` 部署诊断：识别 15 个引擎（SGLang、sglang-router、vLLM、llama.cpp、TensorRT-LLM、LMDeploy、mlx-lm、mlx-serve、TGI、Ollama、TensorFold、strata、Project Maya、cuteafd、ktransformers），扫本机进程、docker 容器、ssh 远端（`--hosts`）、K8s（`--k8s`）、服务 URL（`--url`）、Maya JSON 配置（`--config`）或给定命令行（`--cmd`）。每个实例给出结论（可加速 / 要改参数 / 要打补丁 / 不支持 / 无需处理）和可复制的改动，对应规则 H0–H9、P1–P4、C1–C11、K1–K8；退出码 0 / 1 / 3；`--json` 输出 plan。4.2 的符号检查改为 `yee doctor --adapter`。
+- 新增运行中提示：启动时打印 `[yee] 4.3.0 plan:` 和 `[yee] 要改:`；运行中每 `YEE_EFFECT_S`（默认 600 秒）打印 `[yee] effect:`（E1 投机路径没跑到、E2 召回占比小、E3 多路统计）。`YEE_NOTICE=0` 关闭。
+- 安装脚本新增 generic 模式：找不到 Mia 方案目录时，按诊断结果装到本机进程、docker 容器或 `--hosts` 多机，装进服务实际用的解释器，打印诊断并写 `yee-plan.json`，`--restart` 重启 docker 目标。新参数 `--cmd`、`--url`、`--hosts`、`--config`、`--no-docker`、`--k8s`、`--restart-cmd`、`--plan-out`、`--pip`。Mia 模式不变，安装目录改为 `~/.cache/yee43/`。
+- 新增补丁 `maya-recall`：Project Maya v1.1.66 的召回补丁（`patch -p1` 应用），启动设 `RECALL_ACCEL=1`、`MAYA_GLM_MULTI_MTP=3`。
+- 新增文档 `deploy.md`（适配矩阵、全部规则、集群、K8s、收益预期）；更新 troubleshooting（装了没加速）、patches、env、quickstart、index 和安装说明。
+- 包测试 728 通过、19 跳过；安装脚本测试 Windows 28 通过 8 跳过、WSL 36 通过。尚未在真实 GPU 集群上实测。
+- wheel：`dist/yee-4.3.0-py3-none-any.whl`，sha256 `2d0895855e7258de81727f4849f464dbe4376c431ee7dd10fd1bcee337a5c9d0`。
 
 ## 4.2.0（Yee）
 
@@ -13,6 +25,7 @@
 - 新增一键安装 `install/install.sh`：MiaAI dsv41-4x-spark 自动找方案目录、多台机器都装、`--check` / `--restart` / `--uninstall`，失败自动回退；其它机器走 `pip install` + `yee install-hook`。
 - 支持范围：SGLang（DSPARK/DFLASH/EAGLE/EAGLE3/NEXTN/MTP/STANDALONE/UNO/NGRAM）、vLLM V2（dspark/dflash/eagle/eagle3/mtp）、llama.cpp、TensorRT-LLM、LMDeploy、mlx-lm、transformers、TensorFold、cuteafd、mlx-serve、strata。
 - wheel：`dist/yee-4.2.0-py3-none-any.whl`，sha256 `f6d1e0fde883b60b8d05bbab413bb40c7f8ca3bc155795723ea4ddb7444c6005`。
+
 ## 2.2.0（Yee）
 
 recall-accel 2.1.0 改名为 Yee，并扩展到多个推理框架。详细说明见 `yee doc changelog`（源文件 `yee/docs/changelog.md`）。

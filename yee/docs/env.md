@@ -53,6 +53,17 @@ python -m yee config
 
 它打印每个开关的生效值与来源（`env` = 环境变量设的，`default` = 4.2 默认值，`off` = 关着）。
 
+## 4.3 新增：诊断与提示
+
+这两个变量只影响 Yee 自己的提示输出，不改变任何加速行为。
+
+| 变量 | 默认值 | 作用 |
+|---|---|---|
+| `YEE_NOTICE` | `1` | `0` 关掉启动时的 `[yee] 4.3.0 plan:` 行与运行中的 `[yee] effect:` 行（`yee doctor` 的输出不受影响） |
+| `YEE_EFFECT_S` | `600` | 运行中 `[yee] effect:` 行的间隔秒数；设小一点可以更频繁看到效果判定 |
+
+`YEE_NOTICE=0` 时服务日志里只剩 `[recall] steps=` 这类原本就有的行，不会多打 `[yee]` 开头的内容。
+
 ## 新名字 YEE_*
 
 2.2.0 起，任何 `YEE_XXX` 都等价于 `RECALL_ACCEL_XXX`，`YEE` 等价于 `RECALL_ACCEL`。`import yee` 时会把 `YEE_*` 复制成对应的 `RECALL_ACCEL_*`，但只在后者没设时才复制，所以两者都设时以 `RECALL_ACCEL_*` 为准。

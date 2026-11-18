@@ -1,8 +1,17 @@
-# Yee 4.2.0 文档目录
+# Yee 4.3.0 文档目录
 
 这一页是 Yee 内置文档的目录，`yee doc` 不带参数时列出的就是下面这些 topic。
 
 ## 0. 最短用法
+
+**第一步：跑一次部署诊断。**
+
+```bash
+python -m yee doctor          # 本机进程 + docker 容器；多机加 --hosts，集群加 --k8s
+bash install.sh --check        # 或者用安装脚本的检查模式
+```
+
+报告给出每个实例的结论（可加速 / 要改参数 / 要打补丁 / 不支持）和可复制的改动命令。全适配与集群部署见 [deploy.md](deploy.md)。
 
 4.2.0 起所有加速开关默认打开，不用设任何环境变量。显式设 0 可以单独关掉某一项；设 `YEE=0`（或 `RECALL_ACCEL=0`）整个 Yee 都不加载。
 
@@ -18,12 +27,12 @@ bash install.sh --restart    # 装到 4 台机器，装完重启并做健康检�
 **其它 Python 推理服务**：
 
 ```bash
-pip install yee-4.2.0-py3-none-any.whl && python -m yee install-hook
+pip install yee-4.3.0-py3-none-any.whl && python -m yee install-hook
 ```
 
 然后照常启动服务。
 
-**怎么确认生效**：`python -m yee config`（打印每个开关的生效值与来源：env / default / off）；服务日志里看 `[yee] 4.2.0 defaults:`、`[recall] patched ...`、`[recall] rank check on`、`[recall] steps=...`（数字随请求增长）、`[yee-eb] armed geometry`。
+**怎么确认生效**：`python -m yee config`（打印每个开关的生效值与来源：env / default / off）；服务日志里看 `[yee] 4.3.0 plan:`（能不能加速、要改什么）、`[yee] 4.3.0 defaults:`、`[recall] patched ...`、`[recall] rank check on`、`[recall] steps=...`（数字随请求增长）、`[yee-eb] armed geometry`。
 
 **怎么关**：单项设 0（例如 `RECALL_ACCEL=0`、`YEE_KAD=0`、`VLLM_D_RECALL=0`、`YEE_EXPERT_BUDGET=0`）；整体设 `YEE=0`（或 `RECALL_ACCEL=0`）。
 
@@ -34,6 +43,7 @@ pip install yee-4.2.0-py3-none-any.whl && python -m yee install-hook
 | `readme` | [README.md](README.md) | 总览：Yee 是什么、4.2 最短用法、各基座快速开始、与 2.1 的兼容说明 |
 | `index` | [index.md](index.md) | 本页：全部 topic 的目录 |
 | `quickstart` | [quickstart.md](quickstart.md) | 从零到跑起来的完整步骤：安装、装钩子、验收 |
+| `deploy` | [deploy.md](deploy.md) | 全适配与集群部署：诊断命令与退出码、引擎适配矩阵、投机头规则 H0–H9、补丁 P1–P4、并发 C1–K1–K8、收益预期 |
 | `sglang` | [sglang.md](sglang.md) | SGLang 各加速头的接法、环境变量、Mia 镜像的 sitecustomize 模板 |
 | `vllm` | [vllm.md](vllm.md) | vLLM V2 runner 的接法、投机配置、已知限制 |
 | `tensorfold` | [tensorfold.md](tensorfold.md) | TensorFold 自带 Recall 的用法、Yee 补丁、哪些引擎不读 Recall |
@@ -54,6 +64,7 @@ pip install yee-4.2.0-py3-none-any.whl && python -m yee install-hook
 ## 2. 怎么读
 
 - 第一次用：先看 [quickstart.md](quickstart.md)，再按你的基座看 [sglang.md](sglang.md) / [vllm.md](vllm.md) / [tensorfold.md](tensorfold.md) / [cuteafd.md](cuteafd.md) / [mlx-serve.md](mlx-serve.md)。
+- 要上线到集群（多机、容器、K8s）或想知道改哪个参数：看 [deploy.md](deploy.md)。
 - 想知道「我这个加速头支不支持」：看 [heads.md](heads.md)。
 - 想开逐请求自适应草稿数（KAD）：看 [kad.md](kad.md)；各基座的开关与启动参数也在里面。
 - 想在采样请求上也用：看 [nongreedy.md](nongreedy.md)。

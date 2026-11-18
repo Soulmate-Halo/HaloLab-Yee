@@ -230,6 +230,23 @@
    "rebuild": "CUDA build of the strata target (cmake -DSTRATA_ENABLE_CUDA=ON ..., cmake --build <dir> --target strata); rtx3080n1: /home/ubuntu/xp/build.sh, then copy build-*/strata to /home/ubuntu/xp/engine/strata",
    "summary": "strata engine Yee recall: cross-request copy drafts (C++ port of yee.core RecallRecord + RecallEngine, memory or disk record) replace a window's MTP drafts when the record expects more landed tokens; single-stream GEN and batched BGEN slots; --recall / RECALL_ACCEL=1, unset = upstream; 3.6.0: replicas share one disk record (every replica appends under flock and refreshes every 2 s, STRATA_RECALL_SHARED=0 = the 3.5.x single writer) and a two-process unit test tests/yee_recall_shared_test.cpp"
   },
+  "maya-recall": {
+   "file": "maya-recall/0001-maya-yee-recall.patch",
+   "sha256": "854365f24618c720f2ffaf7f209a516cbd6b22dd7a0064f60acfcebb407d31d4",
+   "kind": "git-patch",
+   "apply_tool": "patch",
+   "baseline": "Project Maya v1.1.66 source tree (patch -p1 in the source root)",
+   "apply_in": "source root (patch -p1)",
+   "notes": {
+    "file": "maya-recall/NOTES-r56.md",
+    "sha256": "8be701606e87069558e5435a48e85ead4fd9ba2fca946b40c7887f6169927d4c"
+   },
+   "env": {
+    "RECALL_ACCEL": "1"
+   },
+   "rebuild": "cmake --build build --target maya",
+   "summary": "Yee recall inside Project Maya's multi-slot scheduler (--parallel N>1): the recalled copies are proposed in the MTP verification window, the C++ part is the same as strata-recall, and concurrency above MAYA_GLM_MULTI_MTP_MAX only records (no drafts); RECALL_ACCEL=1, unset = upstream"
+  },
   "llama.cpp-mtp-vocab": {
    "file": "llama.cpp-mtp-vocab/0001-yee-mtp-vocab.patch",
    "sha256": "c66ebd0c4c0eaf9a6ece54028670ad637b5eac43df9452771c9cbb0a44c4ea9e",

@@ -12,6 +12,43 @@ yee status            # 记录目录和 stats.json
 
 `doctor` 必须在服务进程所用的 Python 解释器（镜像）里跑，否则会显示 sglang / vllm 不可导入。
 
+## 装了没加速（4.3.0）
+
+按这个顺序查，一步一步往下走。
+
+**第 1 步：跑部署诊断。**
+
+```bash
+python -m yee doctor                    # 本机进程 + docker
+python -m yee doctor --hosts <节点列表>  # 多机
+python -m yee doctor --k8s              # 集群
+```
+
+诊断报告给出每个实例的结论（可加速 / 要改参数 / 要打补丁 / 不支持）和**可复制的改动命令**。退出码 1 表示有必改项，先把报告里非「可选」的行改完，再跑一次。
+
+**第 2 步：看运行中的 `[yee] effect:` 行。**
+
+服务日志里 `[recall] steps=` 后面会跟一行效果判定（默认每 600 秒一次，`YEE_EFFECT_S` 可调）：
+
+| 行 | 含义 | 对策 |
+|---|---|---|
+| `E1` | 钩子装上了，但投机路径没跑到 | 照诊断报告里的 H / C 类改动改：多半是没开投机头、EAGLE topk>1、vLLM 没开 V2 runner |
+| `E2` | 召回有贡献但占比小于 2% | 业务重复内容少时这是正常现象；速度主要来自投机头，没有可改的就先接受 |
+| `E3` | 召回链路有错 | 看这一行前面的报错内容 |
+
+**第 3 步：对照最常见的 6 个原因。**
+
+| # | 原因 | 怎么看出来 | 怎么改 |
+|---|---|---|---|
+| 1 | 没开投机头 | 诊断报告里 `head=NONE`；日志没有 `[recall] patched` | 模型自带 MTP/NextN 层时开 MTP（见 [deploy.md](deploy.md) 的 H0）；SGLang 没有草稿模型就 `--speculative-algorithm NGRAM` |
+| 2 | EAGLE 的 topk 大于 1 | 启动参数 `--speculative-eagle-topk 4` 之类 | `--speculative-eagle-topk 1 --speculative-num-draft-tokens <num_steps+1>` |
+| 3 | vLLM 没开 V2 runner | 环境里没有 `VLLM_USE_V2_MODEL_RUNNER=1`；`yee doctor` 里 vLLM 一项 FAIL | 设 `VLLM_USE_V2_MODEL_RUNNER=1` 后重启服务 |
+| 4 | 高并发超出 CUDA graph 批上限，或 vLLM 的 `disable_by_batch_size` | SGLang 的 `--max-running-requests` 大于 `--cuda-graph-max-bs`；vLLM 的 speculative-config 里有 `disable_by_batch_size=N` 且并发超过 N | SGLang：把 `--cuda-graph-max-bs` 提到不低于峰值并发（不超过 512）；vLLM：把 N 提到峰值并发或去掉，然后 A/B 测一下 |
+| 5 | 多机只装了一台 | 日志 `rank check off`；`[recall] steps=` 停住不涨 | 每台都装同一版本：`bash install.sh --hosts <节点列表>` |
+| 6 | 补丁引擎打完没重编 | 引擎日志里没有 `[yee-recall] <引擎>: on`；改了源码行为没变 | 按 [patches.md](patches.md) 重编并重启（llama.cpp：`cmake --build build --target llama-server`；Maya：`cmake --build build --target maya`） |
+
+完整的规则、参数与集群配置见 [deploy.md](deploy.md)。
+
 ## 没有加速
 
 | 现象 | 原因 | 处理 |

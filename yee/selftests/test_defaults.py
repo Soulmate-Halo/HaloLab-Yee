@@ -165,7 +165,7 @@ def test_template_defaults_run_before_mia():
         r = _run_template([PKG_ROOT], mia, mark)
         assert r.returncode == 0, r.stderr[-2000:]
         assert open(mark).read() == "1|1", open(mark).read()
-        assert "EB=1 P=0.9" in r.stdout and "[yee] 4.2.0 defaults:" in r.stdout, r.stdout
+        assert "EB=1 P=0.9" in r.stdout and "[yee] 4.3.0 defaults:" in r.stdout, r.stdout
         os.remove(mark)
         r = _run_template([], mia, mark, fake_yee=True)
         assert r.returncode == 0, r.stderr[-2000:]

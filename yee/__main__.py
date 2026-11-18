@@ -3,7 +3,12 @@
   auto [--cmdline CMD] [--apply]   detect engine + speculative head, check the symbols, print what to set;
                                    --apply also writes the .pth hook into this interpreter
   detect [--cmdline CMD]           the detection part of auto only (JSON)
-  doctor [--adapter NAME]          versions + every symbol / signature / source marker the adapters need
+  doctor [--cmd CMD]... [--url URL]... [--hosts H1,H2] [--config FILE]...
+          [--no-local] [--no-docker] [--k8s] [--json] [--local] [--symbols] [--adapter NAME]
+                                   4.3: find the running inference services (local / docker / k8s / ssh / URL /
+                                   launch command), say whether Yee accelerates them and what to change; the exit
+                                   code is the plan's (0 ok, 1 changes needed, 3 nothing found / unsupported).
+                                   --adapter keeps the 4.2 symbol check only.
   install-hook | uninstall-hook    write / remove yee.pth in this interpreter's site-packages
                                    (uninstall also removes the 2.1 recall_accel.pth)
   status | pause on|off | clear    the record directory's stats.json, the "paused" / "clear.request" files
@@ -191,7 +196,8 @@ def cmd_auto(args) -> int:
     return rc
 
 
-def cmd_doctor(args) -> int:
+def _doctor_symbols(args) -> int:
+    """The 4.2 symbol check: every symbol / signature / source marker the adapters need."""
     from .integrations import registry
 
     v = _versions()
@@ -203,7 +209,7 @@ def cmd_doctor(args) -> int:
             names.extend(registry.SGLANG_ALL)
         if v.get("vllm"):
             names.append("vllm_spec")
-    if not names:
+    if not names or (args.adapter and not (v.get("sglang") or v.get("vllm"))):
         print("doctor: neither sglang nor vllm importable here (TensorFold: yee tensorfold detect)")
         return EXIT_UNSUPPORTED
     bad = 0
@@ -219,6 +225,73 @@ def cmd_doctor(args) -> int:
     print("RECALL_ACCEL on: %s" % _env(ENV_NEW["on"], ENV_OLD["on"], "0"), flush=True)
     print("doctor %s" % ("PASS" if not bad else "FAIL (%d adapter(s))" % bad), flush=True)
     return 0 if not bad else 1
+
+
+def _doctor_engines_here() -> bool:
+    """True when sglang or vllm can be imported here (then the symbol check is worth appending)."""
+    try:
+        import importlib.util
+
+        for name in ("sglang", "vllm"):
+            try:
+                if importlib.util.find_spec(name) is not None:
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _doctor_hosts(value) -> list:
+    out = []
+    for one in str(value or "").replace(";", ",").split(","):
+        one = one.strip()
+        if one:
+            out.append(one)
+    return out
+
+
+def cmd_doctor(args) -> int:
+    """4.3: find the deployment, say what to change; exit code = plan["exit"]."""
+    if getattr(args, "adapter", ""):
+        return _doctor_symbols(args)
+    try:
+        from .integrations import discover, plan
+    except Exception as e:  # noqa: BLE001
+        print("doctor: 发现模块不可用：%r" % (e,), flush=True)
+        return EXIT_UNSUPPORTED
+    local_only = bool(getattr(args, "local", False))
+    hosts = [] if local_only else _doctor_hosts(getattr(args, "hosts", ""))
+    urls = [] if local_only else list(getattr(args, "url", None) or [])
+    use_local = True if local_only else not getattr(args, "no_local", False)
+    use_docker = not getattr(args, "no_docker", False)
+    use_k8s = bool(getattr(args, "k8s", False)) and not local_only
+    try:
+        instances = discover.collect(cmds=list(getattr(args, "cmd", None) or []), urls=urls, hosts=hosts,
+                                     configs=list(getattr(args, "config", None) or []), use_local=use_local,
+                                     use_docker=use_docker, use_k8s=use_k8s)
+    except Exception as e:  # noqa: BLE001
+        print("doctor: 发现部署目标失败：%r" % (e,), flush=True)
+        return EXIT_UNSUPPORTED
+    try:
+        p = plan.analyze(list(instances or []))
+    except Exception as e:  # noqa: BLE001
+        print("doctor: 生成部署诊断失败：%r" % (e,), flush=True)
+        return EXIT_UNSUPPORTED
+    if getattr(args, "json", False):
+        print(json.dumps(p, ensure_ascii=False, indent=1, default=str), flush=True)
+    else:
+        print(plan.render(p), flush=True)
+        if getattr(args, "symbols", False) or _doctor_engines_here():
+            print("符号检查", flush=True)
+            rc = _doctor_symbols(args)
+            if rc and not p.get("exit"):
+                return rc
+    try:
+        return int(p.get("exit") or 0)
+    except Exception:  # noqa: BLE001
+        return EXIT_UNSUPPORTED
 
 
 # ----------------------------------------------------------------------------------------------- hook / record
@@ -466,8 +539,23 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--cmdline", default="", help="the server's launch command (default: running processes)")
         sp.add_argument("--apply", action="store_true", help="auto: also write the .pth hook")
         sp.set_defaults(fn=fn)
-    sp = sub.add_parser("doctor")
-    sp.add_argument("--adapter", default="")
+    sp = sub.add_parser("doctor", help="4.3: find the deployment, say what to change (exit code = the plan's)")
+    sp.add_argument("--cmd", action="append", default=[], metavar="CMD",
+                    help="the server's launch command (repeatable)")
+    sp.add_argument("--url", action="append", default=[], metavar="URL",
+                    help="probe a running server over HTTP (repeatable)")
+    sp.add_argument("--hosts", default="", metavar="H1,H2",
+                    help="comma separated remote hosts to look at over ssh")
+    sp.add_argument("--config", action="append", default=[], metavar="FILE",
+                    help="a Maya launch config (json), repeatable")
+    sp.add_argument("--no-local", action="store_true", help="do not look at the local processes")
+    sp.add_argument("--no-docker", action="store_true", help="do not look at the docker containers")
+    sp.add_argument("--k8s", action="store_true", help="also look at the Kubernetes pods")
+    sp.add_argument("--json", action="store_true", help="print the plan as JSON (kit and ssh parse it)")
+    sp.add_argument("--local", action="store_true",
+                    help="only the local processes and the local docker (ignore --hosts / --url / --k8s)")
+    sp.add_argument("--symbols", action="store_true", help="also run the 4.2 symbol check")
+    sp.add_argument("--adapter", default="", help="only the 4.2 symbol check of this adapter")
     sp.set_defaults(fn=cmd_doctor)
     sub.add_parser("install-hook").set_defaults(fn=cmd_install_hook)
     sub.add_parser("uninstall-hook").set_defaults(fn=cmd_uninstall_hook)

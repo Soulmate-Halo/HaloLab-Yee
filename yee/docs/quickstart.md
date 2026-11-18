@@ -7,8 +7,18 @@
 - 服务已经在跑，并且有一个投机加速头（speculative head）。没有加速头的话，SGLang 可以加 `--speculative-algorithm NGRAM`，这样不需要草稿模型也能用上复制草稿。
 - 你有服务所在机器的 shell 权限，以及服务启动脚本的修改权限。
 - 知道服务用的是哪个 Python 解释器（`ps` 看启动命令，或进容器 `which python3`）。
+- 不确定服务能不能加速时，先跑 `python -m yee doctor`，见 [deploy.md](deploy.md)。
 
-## 1. 4.2.0 最短用法
+## 1. 4.3.0 最短用法
+
+**第一步：跑一次部署诊断。**
+
+```bash
+python -m yee doctor          # 本机进程 + docker 容器；多机加 --hosts，集群加 --k8s
+bash install.sh --check        # 或者用安装脚本的检查模式
+```
+
+报告告诉你每个实例现在能不能加速、要改哪个参数、要打哪个补丁，每条改动都能直接复制。全适配与集群部署的完整说明见 [deploy.md](deploy.md)。
 
 4.2.0 起所有加速开关默认打开，不用设任何环境变量。显式设 0 可以单独关掉某一项；设 `YEE=0`（或 `RECALL_ACCEL=0`）整个 Yee 都不加载。
 
@@ -32,7 +42,7 @@ bash install.sh --uninstall --restart
 ### 其它 Python 推理服务
 
 ```bash
-pip install yee-4.2.0-py3-none-any.whl && python -m yee install-hook
+pip install yee-4.3.0-py3-none-any.whl && python -m yee install-hook
 ```
 
 然后照常启动服务，不需要再手动加环境变量。
@@ -42,7 +52,7 @@ pip install yee-4.2.0-py3-none-any.whl && python -m yee install-hook
 在**服务实际使用的 Python 环境**里执行：
 
 ```bash
-pip install --no-deps yee-4.2.0-py3-none-any.whl
+pip install --no-deps yee-4.3.0-py3-none-any.whl
 ```
 
 只依赖 numpy。`--no-deps` 避免动服务环境里的其它包。
@@ -56,6 +66,8 @@ python -m yee config
 ```
 
 `doctor` 会列出各适配器需要的符号、签名、源码标记；有任何 FAIL 就**停下**，不要改服务源码，把输出交给人工处理。`selftest` 跑自带的测试组，不需要 pytest。`config` 打印每个开关的生效值与来源（env / default / off）。
+
+想看整个部署（多机、容器、集群）的结论，跑 `python -m yee doctor`；用法与退出码见 [deploy.md](deploy.md)。
 
 ## 3. 让 Yee 认出你的服务
 
@@ -113,7 +125,8 @@ export VLLM_USE_V2_MODEL_RUNNER=1
 
 | 日志 | 含义 |
 |---|---|
-| `[yee] 4.2.0 defaults:` | 4.2 的默认值已生效 |
+| `[yee] 4.3.0 plan: ...` | 4.3 启动诊断：能不能加速、要改什么 |
+| `[yee] 4.3.0 defaults:` | 4.2 起的默认值已生效 |
 | `[recall] patched ...`（SGLang / vLLM）或 `[recall-accel] patched` | 召回钩子已装上 |
 | `[recall] rank check on` | 各 TP rank 装的是同一版本 Yee，召回广播与专家预算启用 |
 | `[recall] steps=... used=... landed=...` | 召回统计，数字随请求增长 |
@@ -159,6 +172,7 @@ Mia dsv41-4x-spark 用一键脚本回退：`bash install.sh --uninstall --restar
 
 ## 10. 各基座的入口
 
+- 全适配与集群部署：[deploy.md](deploy.md)
 - SGLang：[sglang.md](sglang.md)
 - vLLM：[vllm.md](vllm.md)
 - TensorFold：[tensorfold.md](tensorfold.md)（自带 Recall，通常不需要装钩子）

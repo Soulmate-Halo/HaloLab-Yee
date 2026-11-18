@@ -32,6 +32,7 @@ yee patch apply <base> --src DIR [--variant v] [--check]
 | `mlx-serve-kad` | source-drop | 已拷上 `mlx-serve-2.4` 的 M5 xypd 线上源码（r608 src_base；`dspark.zig` sha256 `30412c8bd5a1e1b2...`、`dspark_group.zig` `c37b03e31a08b678...`），**先拷 `mlx-serve-2.4`** | `d_recall.zig`、`dspark.zig`、`dspark_group.zig`、`kad.zig`、`kad_live.zig`、`kad_stdio.zig` | `src/engines/mlx/spec/` |
 | `llama.cpp-kad` | git-patch | ggml-org/llama.cpp v0.9.0 commit `cd959bae99ff4bed22bef2604f45241c09bbb8c8` | `llama.cpp-kad/0001-kad.patch` | 仓库根目录 |
 | `llama.cpp-recall` | git-patch | 同上，**并已打好 `llama.cpp-kad/0001-kad.patch`**（先打 `llama.cpp-kad`） | `llama.cpp-recall/0002-recall.patch` | 仓库根目录 |
+| `maya-recall` | patch（`patch -p1`） | Project Maya v1.1.66（Strata 分支） | `maya-recall/0001-maya-yee-recall.patch` | Maya 源码根目录 |
 
 ### tensorfold
 
@@ -234,6 +235,35 @@ YEE_MTP_VOCAB_N=131072 llama-server -m <带 MTP 的 gguf> -ngl 99 --spec-type dr
 - 生效日志：`[yee-mtp-vocab] MTP draft head limited to first 131072 of 248320 tokens`。
 - 已知限制：只对 qwen35 / qwen35moe 的 MTP 图生效；N 要按模型量（`yee/tools/mtp_bench/vocab_coverage.py`），Qwen3.6 用 131072；输出头带逐行缩放时不截断。
 
+### maya-recall（4.3.0 新增）
+
+给 Project Maya v1.1.66（Strata 分支）加跨请求召回。Maya 的 token 循环在 C++ 进程里，Python 钩子碰不到，所以以源码补丁接入：召回库是 Yee 的 C++ 移植（与 strata、llama.cpp 的补丁同一份），召回提议替换 MTP 验证窗口里的草稿，窗口逐个核对草稿。
+
+```
+yee patch apply maya-recall --src <Maya 源码根> --check
+yee patch apply maya-recall --src <Maya 源码根>
+# 重编并重启
+cmake --build build --target maya
+```
+
+- 补丁内容：改 `CMakeLists.txt`（`strata_spec` 加两个源文件、链接 `Threads::Threads`），改 `src/program/generate.cpp`（GLM 多槽调度器，`--parallel N`），新增召回库与引擎适配层、三个单测文件，以及 `third_party/nlohmann/include/nlohmann/json.hpp`（3.11.3，MIT）。
+- 开关：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `RECALL_ACCEL` 或 `YEE_RECALL` | 关 | `1` 打开召回；不设时新代码被短路，行为与原版一致 |
+| `RECALL_ACCEL_DIR` | 空（内存记录） | 磁盘记录目录；多个进程可共用（`STRATA_RECALL_SHARED=1` 默认，每 2 秒读入别人写的） |
+| `RECALL_ACCEL_GIB` | 0.0625 | 记录容量 |
+| `RECALL_ACCEL_READ_ONLY` | 0 | 只读记录 |
+| `RECALL_ACCEL_MIN_MATCH` | 16 | 最短匹配长度（token） |
+| `YEE_RECALL_LOG_S` | 30 | 统计行间隔（秒） |
+| `MAYA_YEE_RECALL_ROWS` | 不设（= 1 + `MAYA_GLM_MULTI_MTP`） | 验证窗口至少这么多行（上限 16）；设 8 时召回一槽最多给 7 个草稿，MTP 草稿链仍只做 `MAYA_GLM_MULTI_MTP` 个 |
+| `MAYA_GLM_MULTI_MTP` | 不设 | MTP 草稿数；H7 要求它是 3 |
+
+- 生效日志：`[yee-recall] maya: on, backend <memory|disk>, dir <dir|->, gamma <n>, read_only <0|1>`。
+- 已知限制：只在 MTP 验证窗口里起作用；`MAYA_GLM_MULTI_MTP_MAX`（默认 4）决定窗口只在运行中的请求不超过 4 个时启用，超过时**召回只记账、不出草稿**；带图请求不用召回；单进程 `--parallel 1` 不走多槽调度器，不接召回；温度大于 0 的请求草稿只按 token 验证，输出分布不变。
+- 8×3080 实测：8 路放开（`MAYA_GLM_MULTI_MTP_MAX=0`）后 65.1 tok/s，默认配置是 76.6 tok/s，放开反而更慢，只在 GPU 不是瓶颈时考虑。
+
 ## 回退
 
 | base | 回退方法 |
@@ -250,6 +280,7 @@ YEE_MTP_VOCAB_N=131072 llama-server -m <带 MTP 的 gguf> -ngl 99 --spec-type dr
 | `mia-dsv41-image-budget` | 把 `DIR/.yee-backup-<时间戳>/srt/multimodal/deepseek_v41_image_processing.py` 拷回原处，重启 D；不还原文件时去掉 `XY_DSV41_IMAGE_BUDGET_RESERVE`（缺省 0）即与原版一致 |
 | `strata-recall` | 仓库根目录执行 `git apply -R "$(yee patch path strata-recall)"`（没有 git 用 `patch -p1 -R -i <同一路径>`），重新编译；不重编时去掉 `RECALL_ACCEL`（或 `--recall`、`YEE_RECALL`）即与上游逐位一致；rtx3080n1 也可直接换回备份的 `engine/strata` |
 | `llama.cpp-mtp-vocab` | 仓库根目录执行 `git apply -R "$(yee patch path llama.cpp-mtp-vocab)"`，重新编译；不重编时去掉 `YEE_MTP_VOCAB_N` 即与上游逐位一致 |
+| `maya-recall` | Maya 源码根目录执行 `patch -p1 -R < maya-yee-recall.patch` 后重编；或换回备份的 `build/maya`；不重编时去掉 `RECALL_ACCEL` 即与原版逐位一致 |
 
 回退前先确认补丁版本：`yee patch list` 显示的 variant 要和当初应用的一致。
 

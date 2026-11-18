@@ -54,6 +54,12 @@ def main() -> int:
             expert_budget.install()
         except Exception as e:  # noqa: BLE001  never take the process down
             print("[yee-eb] autoload failed: %r" % (e,), flush=True)
+    try:  # 4.3: what Yee does for this launch command and which parameters to change (YEE_NOTICE=0: quiet)
+        from .integrations import plan
+
+        plan.print_startup()
+    except Exception:  # noqa: BLE001
+        pass
     return 0
 
 

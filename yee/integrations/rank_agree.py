@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from datetime import timedelta
 
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 _CACHE = {}
 
 

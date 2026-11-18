@@ -108,9 +108,9 @@ tensorfold serve MODEL --recall
 
 需要 priced 兜底时再加 `TF_RECALL_AFTER_PRICED=1` 和 Yee 补丁。
 
-## 7. 采样请求也是无损的
+## 7. 采样请求的输出分布也不变
 
-TensorFold 的采样请求（temperature>0、top-k/top-p）用**带种子的确定性采样逐位验证**，召回草稿同样无损。上游测试 `"greedy and sampled"` 覆盖了这两种情形。
+TensorFold 的采样请求（temperature>0、top-k/top-p）用**带种子的确定性采样逐位验证**，召回草稿同样不改变输出分布。上游测试 `"greedy and sampled"` 覆盖了这两种情形。
 
 ## 8. 跑基准时的注意事项
 

@@ -215,7 +215,9 @@ def apply(base: str, src: str, variant=None, check: bool = False, manifest=None,
     if e.get("kind") == "source-drop":
         return _apply_source_drop(e, src, check, root)
     if e.get("kind") == "git-patch":
-        return _apply_git_patch(resolve(files[0]["file"], root), os.path.abspath(src), check, git)
+        # 4.3: a base whose MANIFEST entry says apply_tool "patch" is applied with patch(1), never with git
+        tool = "" if e.get("apply_tool") == "patch" else git  # "" = act as if git were missing
+        return _apply_git_patch(resolve(files[0]["file"], root), os.path.abspath(src), check, tool)
     raise PatchUsageError("unknown kind %r" % (e.get("kind"),))
 
 

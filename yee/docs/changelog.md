@@ -2,6 +2,38 @@
 
 这一页列出 Yee 各版本的变化。
 
+## 4.3.0
+
+### `yee doctor` 全适配诊断：装没装、能不能加速、改哪个参数，一眼看完
+
+- `python -m yee doctor` 扫全部署：认得 15 个引擎（SGLang、vLLM、llama.cpp、TensorRT-LLM、LMDeploy、mlx-lm、mlx-serve、TensorFold、strata、Maya、cuteafd、TGI、Ollama、ktransformers、unknown），发现本机进程、docker 容器、ssh 远端（`--hosts`）、K8s（`--k8s`）、远端 URL（`--url`）、Maya 的 JSON 启动配置（`--config`）。
+- 每个实例给一个结论：**可加速 / 要改参数才能加速 / 要打补丁 / 不支持 / 无需处理**，并列出功能状态（召回、KAD、专家预算、树形、记录共享）。
+- 改动清单里的每一项都是**可以直接复制的**：参数片段、`KEY=VALUE`、补丁命令、路由配置。规则号 H0–H9（投机头）、P1–P4（补丁引擎）、C1–C11（并发与多流）、K1–K8（集群）逐条对应。
+- 退出码：`0` 全部可用或无需处理；`1` 有要改参数 / 要打补丁 / 集群必改项；`3` 没找到实例或全部不支持。
+- `--json` 输出 plan JSON，供脚本与远端解析。
+
+### 运行中的 `[yee] plan` / `[yee] effect:` 提示
+
+- 服务启动时（认得出引擎的进程，每进程一次）打印 `[yee] 4.3.0 plan: <engine> head=<头> -> <结论>`，有改动时跟几行 `[yee] 要改: <可复制内容>`，末尾提示 `python -m yee doctor`。
+- 运行中在 `[recall] steps=` 之后按 `YEE_EFFECT_S`（默认 600 秒）打印 `[yee] effect:` 行：`E1` 表示钩子装上了但投机路径没跑到，`E2` 表示召回贡献占比很小，`E3` 表示链路有错，其余是正常工作的统计。
+- 两个提示都可关：`YEE_NOTICE=0`。
+
+### 安装套件 generic 模式（任何部署）
+
+- `install.sh` 不再只认 Mia 方案：找不到方案目录时自动走 generic 模式，本机进程、docker 容器、`--hosts` 指定的每台机器都能装，装完打印诊断报告并写 `yee-plan.json`。
+- 容器目标自动用容器里的解释器安装并核对，容器重建会丢的情况给出两种持久做法（装进镜像，或挂载 + `PYTHONPATH`）。
+- 新参数：`--cmd`、`--url`、`--hosts`、`--config`、`--no-docker`、`--k8s`、`--restart-cmd`、`--plan-out`、`--pip`。
+
+### 新增 `maya-recall` 补丁
+
+- Project Maya v1.1.66 的跨请求召回补丁（`patch -p1`），重编命令 `cmake --build build --target maya`。
+- 开关：`RECALL_ACCEL=1`、`RECALL_ACCEL_DIR=<目录>`、`MAYA_GLM_MULTI_MTP=3`、`MAYA_YEE_RECALL_ROWS`。
+- 限制：`MAYA_GLM_MULTI_MTP_MAX`（默认 4）之外时召回只记账；8×3080 实测 8 路放开后 65.1 tok/s，默认配置 76.6 tok/s。
+
+### 新增文档 `deploy.md`
+
+全适配与集群部署一页纸：诊断命令与退出码、15 个引擎的适配矩阵、投机头规则 H0–H9、补丁引擎 P1–P4、并发与多流 C1–C11、集群与部署形态 K1–K8（多卡 TP/PP/EP、多副本同机与跨机、PD 分离、K8s、容器持久做法）、怎么看是否生效、收益预期。
+
 ## 4.2.0
 
 ### 所有加速开关默认打开，不依赖启动参数；跨 rank 一致性检查；一键安装
@@ -77,7 +109,7 @@
 
 - 问题：召回一直是在“这次请求的内容”里找与历史记录重复的片段，所以同一个问题被改写（换了日期、换了会话 id、换了系统提示的开头）之后，往往找不到上一次那份回答，只能从头生成。
 - 做法：请求正常结束时，把这次的回答（最多 16384 个 token）按提示的哈希存起来。哈希分 4 级：整段提示、提示末尾 512 个 token、末尾 128 个、末尾 32 个（提示本身不长于该级时跳过该级）。新请求开始时依次查这 4 级，命中就从第 1 个输出 token 起，用那份旧回答当草稿；输出与旧回答分叉之后，用最近 4 个输出 token 在这份旧回答里重新对齐，对上就接着出草稿。
-- 无损：草稿照常由目标模型逐 token 验证，命中错了只是这份草稿被拒，输出不变。qhash 与原有的两个来源（`own`、`record`）并列，走同一套按来源和档位的期望值选择；统计里 `tiers` 多出 `qhash_*` 三档。
+- 草稿照常由目标模型逐 token 验证，命中错了只是这份草稿被拒，输出不变。qhash 与原有的两个来源（`own`、`record`）并列，走同一套按来源和档位的期望值选择；统计里 `tiers` 多出 `qhash_*` 三档。
 - 存储：disk 后端时每个键一个文件 `<召回目录>/qhash/<键>.i4`（int32 小端），原子替换写入，每次查找直接读文件——所以多个进程共用同一个目录都能看到，重启后也还在；最多保留 8192 个键文件（按修改时间删最旧的）。memory / cuda 后端时只存在进程内存里。`yee clear`（清库）时一并清空。
 - 开关：默认开 1，设 0 关闭，关闭后行为与 3.6.0 完全相同。yee 是 `RECALL_ACCEL_QHASH`（旧名 `SGLANG_D_RECALL_QHASH`、`DSV41_RECALL_QHASH`），vllm_d_recall 是 `VLLM_D_RECALL_QHASH`。
 - 统计新增：`qhash`（是否开启）、`qhash_hits`（新请求命中次数）、`qhash_realigns`（分叉后重新对齐次数）、`qhash_puts`（写入次数）、`qhash_entries`（当前键数）。
@@ -258,7 +290,7 @@
 
 ### 测试
 
-- 新增 `test_tree.py`：去重、树合并与剪枝的祖先闭包、SGLang 数组转换的往返和手算对拍、贪心/点质量/SpecInfer 三种验证的无损性蒙特卡洛（TV < 0.02）、单候选时选择器退化、`propose_select` 与 `propose` 在单候选下逐项一致、`yee bases` 的 tree 字段。
+- 新增 `test_tree.py`：去重、树合并与剪枝的祖先闭包、SGLang 数组转换的往返和手算对拍、贪心/点质量/SpecInfer 三种验证的一致性蒙特卡洛（TV < 0.02）、单候选时选择器退化、`propose_select` 与 `propose` 在单候选下逐项一致、`yee bases` 的 tree 字段。
 
 ## 2.2.0
 

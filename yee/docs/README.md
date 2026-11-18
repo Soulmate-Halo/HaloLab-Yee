@@ -1,10 +1,19 @@
-# Yee 4.2.0 使用文档
+# Yee 4.3.0 使用文档
 
 本文档是 Yee 的总览：它是什么、怎么装、各个基座怎么用、去哪一页看细节。
 
 Yee 是一个「跨请求召回」加速模块：把服务读过、写过的 token id 记下来，当新请求和历史内容重复时，直接把后续内容复制成草稿，交给服务正在用的加速头去验证。复制来的每一个 token 都由目标模型逐个验证，命中得多就少走几步。
 
-## 0. 4.2.0 最短用法
+## 0. 4.3.0 最短用法
+
+**第一步：跑一次部署诊断。**
+
+```bash
+python -m yee doctor          # 本机进程 + docker 容器；多机加 --hosts，集群加 --k8s
+bash install.sh --check        # 或者用安装脚本的检查模式
+```
+
+报告给出每个实例的结论（可加速 / 要改参数 / 要打补丁 / 不支持）和**可复制的改动命令**；退出码 `0` 表示不用改，`1` 表示有要改的，`3` 表示没找到实例或全部不支持。全适配与集群部署见 [deploy.md](deploy.md)。
 
 4.2.0 起所有加速开关默认打开，不用设任何环境变量。显式设 0 可以单独关掉某一项；设 `YEE=0`（或 `RECALL_ACCEL=0`）整个 Yee 都不加载。
 
@@ -28,7 +37,7 @@ bash install.sh --uninstall --restart
 ### 其它 Python 推理服务
 
 ```bash
-pip install yee-4.2.0-py3-none-any.whl && python -m yee install-hook
+pip install yee-4.3.0-py3-none-any.whl && python -m yee install-hook
 ```
 
 然后照常启动服务，不需要再手动加环境变量。
@@ -43,11 +52,14 @@ python -m yee config
 
 | 日志 | 含义 |
 |---|---|
-| `[yee] 4.2.0 defaults:` | 4.2 的默认值已生效 |
+| `[yee] 4.3.0 plan: ...` | 4.3 启动诊断：这一行直接写这个实例能不能加速、要改什么 |
+| `[yee] effect: ...` | 运行中的效果判定（默认每 600 秒一次，`YEE_EFFECT_S` 可调）；`E1` 投机路径没跑到、`E2` 召回占比小、`E3` 链路有错 |
 | `[recall] patched ...` | 召回钩子已装上 |
 | `[recall] rank check on` | 各 TP rank 装的是同一版本 Yee，召回广播与专家预算启用 |
 | `[recall] steps=...` | 召回统计，数字随请求增长 |
 | `[yee-eb] armed geometry ...` | 热专家验证预算已就绪 |
+
+两个 `[yee]` 提示都能关：设 `YEE_NOTICE=0`。
 
 ### 怎么关
 
@@ -63,6 +75,15 @@ python -m yee config
 | 旧包名 | `recall_accel` | 仍可导入，仍可用 |
 | 旧命令 | `recall-accel` | 仍可执行，与 `yee` 等价 |
 | 旧环境变量 | `RECALL_ACCEL_*` | 仍可读，优先级低于新的 `YEE_*` |
+
+### 4.3.0：`yee doctor` 全适配诊断、运行中提示、generic 安装、maya-recall 补丁
+
+- `python -m yee doctor` 扫全部署：认得 15 个引擎（SGLang、vLLM、llama.cpp、TensorRT-LLM、LMDeploy、mlx-lm、mlx-serve、TensorFold、strata、Maya、cuteafd、TGI、Ollama、ktransformers、unknown），发现本机进程、docker 容器、ssh 远端（`--hosts`）、K8s（`--k8s`）、远端 URL（`--url`）、Maya 的 JSON 启动配置（`--config`）。
+- 每个实例给一个结论（可加速 / 要改参数才能加速 / 要打补丁 / 不支持 / 无需处理），改动清单里的每一项都是可以直接复制的。退出码：`0` 全部可用或无需处理；`1` 有要改参数 / 要打补丁 / 集群必改项；`3` 没找到实例或全部不支持。
+- 服务启动时打印 `[yee] 4.3.0 plan: ...`（每个进程一次），运行中按 `YEE_EFFECT_S`（默认 600 秒）打印 `[yee] effect:` 行；`YEE_NOTICE=0` 可关掉这两个提示。
+- 安装套件新增 generic 模式：找不到 Mia 方案目录时自动走本机进程 / docker / 多机（`--hosts`）/ K8s 的发现与安装，装完打印诊断报告并写 `yee-plan.json`。
+- 新增 `maya-recall` 补丁（Project Maya v1.1.66，`patch -p1`，重编 `cmake --build build --target maya`）：`RECALL_ACCEL=1`、`RECALL_ACCEL_DIR=<目录>`、`MAYA_GLM_MULTI_MTP=3`；`MAYA_GLM_MULTI_MTP_MAX`（默认 4）之外时召回只记账。
+- 新增文档 [deploy.md](deploy.md)：全适配与集群部署一页纸。
 
 ### 4.2.0：所有加速开关默认打开
 
@@ -161,7 +182,7 @@ SGLang Mia（DeepSeek-V4.1）的验证矩形宽度固定为 [并发, 块长+1]�
 在**服务实际使用的 Python 环境**里执行（通常是镜像里的那个 python）：
 
 ```bash
-pip install --no-deps yee-4.2.0-py3-none-any.whl
+pip install --no-deps yee-4.3.0-py3-none-any.whl
 ```
 
 只依赖 numpy，镜像里一般已经有；`--no-deps` 可以避免它去动服务环境里的其它包。
@@ -193,6 +214,7 @@ Mia dsv41-4x-spark 用发布包里的一键安装脚本，见第 0 节。
 |---|---|
 | [index.md](index.md) | 全部 topic 的一页目录（`yee doc` 不带参数时列的就是它） |
 | [quickstart.md](quickstart.md) | 从零到跑起来的完整步骤与验收方法 |
+| [deploy.md](deploy.md) | 全适配与集群部署：诊断命令与退出码、引擎适配矩阵、规则 H/P/C/K、收益预期 |
 | [sglang.md](sglang.md) | SGLang 各加速头的接法、环境变量、sitecustomize 模板 |
 | [vllm.md](vllm.md) | vLLM V2 runner 的接法与限制 |
 | [tensorfold.md](tensorfold.md) | TensorFold 自带 Recall、Yee 补丁、引擎缺口 |

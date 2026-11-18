@@ -2,14 +2,24 @@
 # -*- coding: utf-8 -*-
 """Yee 一键安装（只用标准库，Python 3.8+）。
 
-在 MiaAI dsv41-4x-spark / dsv41-3x-spark 方案的 head 宿主机上运行：
+两种模式。
+
+Mia 模式：在 MiaAI dsv41-4x-spark / dsv41-3x-spark 方案的 head 宿主机上运行：
 
     bash install.sh --check              只检查，不写任何东西
     bash install.sh --restart            每台机器都装、重启服务、健康检查 + 冒烟，失败自动回退
     bash install.sh --uninstall --restart
 
-不是 Mia 方案的机器：pip 装进当前 Python，再 ``python -m yee install-hook``，之后从这个 Python 启动的推理服务
-都会加载 Yee。Yee 的开关全部默认打开，不需要设任何别的环境变量。
+generic 模式：任何部署（Mia 方案以外的本机进程、docker 容器、多台机器、K8s）：
+
+    bash install.sh --check              只诊断，不装
+    bash install.sh                      给发现的 Python 引擎装上，然后打印诊断报告
+    bash install.sh --hosts h1,h2        连别的机器一起看、一起装
+    bash install.sh --restart            装完重启 docker 容器，再诊断一次
+    bash install.sh --uninstall          卸载
+
+generic 模式用 wheel 里的 yee.integrations.discover / plan 做发现与诊断，装进每个目标解释器的都是同一个 wheel。
+Yee 的开关全部默认打开，不需要设任何别的环境变量。--pip 保留老路径：只装进当前 Python。
 """
 from __future__ import annotations
 
@@ -17,12 +27,14 @@ import argparse
 import datetime as _dt
 import glob
 import hashlib
+import importlib
 import io
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -62,6 +74,19 @@ def txt(b):
     if isinstance(b, str):
         return b
     return b.decode("utf-8", "replace")
+
+
+def json_tail(text):
+    """JSON printed after other lines: once the hook is installed, every interpreter start prints [yee] lines first."""
+    text = text or ""
+    lines = text.splitlines()
+    for k, ln in enumerate(lines):
+        if ln.lstrip().startswith(("{", "[")):
+            try:
+                return json.loads("\n".join(lines[k:]))
+            except ValueError:
+                continue
+    return json.loads(text or "{}")
 
 
 def sha256_bytes(b):
@@ -252,6 +277,7 @@ class Wheel:
             raise Abort("找不到 wheel：%s" % path)
         with zipfile.ZipFile(self.path) as z:
             names = z.namelist()
+            self.names = list(names)
             self.version = ""
             for n in names:
                 if n.endswith(".dist-info/METADATA") and n.startswith("yee-"):
@@ -301,9 +327,13 @@ def tar_dir(src):
 
 # ------------------------------------------------------------------ installer
 class Installer:
-    def __init__(self, args, runner=None):
+    PY_ENGINES = ("sglang", "vllm", "trtllm", "lmdeploy", "mlx_lm")
+    PATCH_ENGINES = ("llama.cpp", "strata", "maya", "mlx-serve", "cuteafd", "tensorfold")
+
+    def __init__(self, args, runner=None, modules=None):
         self.a = args
         self.r = runner or Runner()
+        self.modules = modules
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.notes = []
 
@@ -337,12 +367,16 @@ class Installer:
                 found = find_recipes(self.script_dir)
                 if len(found) > 1:
                     raise Abort("找到多个方案目录，用 --recipe 选一个：%s" % "，".join(found))
-                mode = "mia" if found else "pip"
+                mode = "mia" if found else "generic"
                 if found:
                     self.a.recipe = found[0]
-        say("模式：%s" % ("Mia 方案（多机容器）" if mode == "mia" else "pip（当前 Python）"))
+        say("模式：%s" % {"mia": "Mia 方案（多机容器）",
+                          "generic": "generic（任何部署：本机进程 / docker / 多机 / K8s）",
+                          "pip": "pip（当前 Python）"}.get(mode, mode))
         if mode == "pip":
             return self.pip_mode()
+        if mode == "generic":
+            return self.generic_mode()
         return self.mia_mode()
 
     # -------------------------------------------------- pip mode
@@ -365,6 +399,302 @@ class Installer:
                 print(txt(out))
         say("完成。之后用 %s 启动的推理服务会自动加载 Yee；关闭用 YEE=0。" % py)
         return 0
+
+    # -------------------------------------------------- generic mode
+    @property
+    def runner(self):
+        return self.r
+
+    def load_modules(self):
+        """从 wheel 里 import yee.integrations.discover / plan；测试可以传 modules=(discover, plan) 顶掉。"""
+        if self.modules:
+            return self.modules[0], self.modules[1]
+        path = self.wheel.path
+        saved_path = list(sys.path)
+        for name in [n for n in list(sys.modules) if n == "yee" or n.startswith("yee.")]:
+            del sys.modules[name]
+        sys.path.insert(0, path)
+        try:
+            discover = importlib.import_module("yee.integrations.discover")
+            plan = importlib.import_module("yee.integrations.plan")
+        except Exception as e:  # noqa: BLE001
+            names = getattr(self.wheel, "names", [])
+            has = [n for n in names
+                   if n.startswith("yee/integrations/discover") or n.startswith("yee/integrations/plan")]
+            for name in [n for n in list(sys.modules) if n == "yee" or n.startswith("yee.")]:
+                del sys.modules[name]
+            raise Abort("wheel %s 里没有可用的 yee.integrations.discover / plan（%s%s）；请用完整的 4.3 wheel 重试"
+                        % (os.path.basename(path), e,
+                           "" if has else "；这个 wheel 里根本没有 yee/integrations/"))
+        finally:
+            sys.path[:] = saved_path
+        return discover, plan
+
+    def collect_instances(self, discover):
+        a = self.a
+        hosts = []
+        for h in (a.hosts or []):
+            for one in str(h).replace(";", ",").split(","):
+                one = one.strip()
+                if one:
+                    hosts.append(one)
+        try:
+            found = discover.collect(cmds=list(a.cmd or []), urls=list(a.url or []), hosts=hosts,
+                                     configs=list(a.config or []), use_local=True, use_docker=not a.no_docker,
+                                     use_k8s=bool(a.k8s), runner=self.runner)
+        except Exception as e:  # noqa: BLE001
+            raise Abort("发现部署目标失败：%s" % e)
+        return list(found or [])
+
+    def is_local_host(self, host):
+        if not host:
+            return True
+        h = host.split("@")[-1].strip().lower()
+        if not h:
+            return True
+        me = socket.gethostname()
+        names = {"local", "localhost", "127.0.0.1", "::1", me.lower(), me.split(".")[0].lower()}
+        return h in names or h.split(".")[0] in names
+
+    def remote_argv(self, host, argv):
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host,
+                " ".join(shlex.quote(a) for a in argv)]
+
+    def exec_argv(self, host, argv):
+        if self.is_local_host(host):
+            return list(argv)
+        return self.remote_argv(host, argv)
+
+    def docker_python(self, host, container):
+        cmd = ["docker", "exec", container, "sh", "-c", "command -v python3 || command -v python"]
+        rc, out, err = self.r.run(self.exec_argv(host, cmd), timeout=120)
+        if rc != 0:
+            return None
+        lines = [l.strip() for l in txt(out).splitlines() if l.strip()]
+        return lines[0] if lines else None
+
+    def ssh_python(self, host):
+        cmd = ["sh", "-c", "command -v python3 || command -v python"]
+        rc, out, err = self.r.run(self.remote_argv(host, cmd), timeout=120)
+        if rc != 0:
+            return None
+        lines = [l.strip() for l in txt(out).splitlines() if l.strip()]
+        return lines[0] if lines else None
+
+    @staticmethod
+    def argv_python(inst):
+        """argv[0] of the server when it is an absolute python path (a venv's bin/python stays a venv path)."""
+        argv = inst.get("argv") or []
+        argv0 = argv[0] if argv else ""
+        if argv0.startswith("/") and os.path.basename(argv0).startswith("python"):
+            return argv0
+        return None
+
+    def local_python(self, inst, pid):
+        # argv[0] first: /proc/<pid>/exe resolves a venv's python to the base interpreter, whose pip would install
+        # into the wrong site-packages; then the venv / conda prefix of the process; then the exe link.
+        py = self.argv_python(inst)
+        if py:
+            return py
+        if pid:
+            try:
+                with open("/proc/%s/environ" % pid, "rb") as f:
+                    penv = dict(kv.split(b"=", 1) for kv in f.read().split(b"\0") if b"=" in kv)
+                for k in (b"VIRTUAL_ENV", b"CONDA_PREFIX"):
+                    pre = penv.get(k, b"").decode("utf-8", "replace").strip()
+                    for name in ("python3", "python"):
+                        cand = os.path.join(pre, "bin", name)
+                        if pre and os.path.exists(cand):
+                            return cand
+            except (OSError, ValueError):
+                pass
+            try:
+                link = os.readlink("/proc/%s/exe" % pid)
+                if link:
+                    return link
+            except OSError:
+                pass
+        argv = inst.get("argv") or []
+        argv0 = argv[0] if argv else ""
+        if os.path.basename(argv0).startswith("python"):
+            return argv0
+        return None
+
+    def classify(self, instances):
+        """把实例分成三类目标：本机进程 / docker 容器 / ssh 主机；补丁引擎只进报告。"""
+        targets, skipped = [], []
+        for inst in instances:
+            engine = (inst.get("engine") or "").strip().lower()
+            where = inst.get("where") or {}
+            container = (where.get("container") or "").strip() or None
+            host = (where.get("host") or "").strip() or None
+            pid = where.get("pid")
+            if engine in self.PATCH_ENGINES:
+                skipped.append("补丁引擎 %s：不自动装，报告里给补丁与重编命令" % engine)
+                continue
+            if engine not in self.PY_ENGINES:
+                skipped.append("引擎 %s 不在自动挂钩范围（报告里会写支持情况）" % (engine or "未知"))
+                continue
+            if container:
+                py = self.argv_python(inst) or self.docker_python(host, container)
+                if not py:
+                    skipped.append("容器 %s 里找不到 python3/python" % container)
+                    continue
+                targets.append({"kind": "docker", "host": None if self.is_local_host(host) else host,
+                                "container": container, "py": py, "key": "docker:%s:%s:%s" % (host, container, py),
+                                "label": "容器 %s" % container})
+                continue
+            if host and not self.is_local_host(host):
+                py = self.ssh_python(host)
+                if not py:
+                    skipped.append("%s 上找不到 python3/python" % host)
+                    continue
+                targets.append({"kind": "ssh", "host": host, "container": None, "py": py,
+                                "key": "ssh:%s:%s" % (host, py), "label": "机器 %s" % host})
+                continue
+            py = self.local_python(inst, pid)
+            if not py:
+                skipped.append("本机进程 %s 找不到解释器" % (pid or "?"))
+                continue
+            targets.append({"kind": "local", "host": None, "container": None, "py": py, "key": "local:%s" % py,
+                            "label": "本机进程 %s" % (pid or "?")})
+        return targets, skipped
+
+    def target_argv(self, t, argv):
+        """在目标上执行一条命令：容器走 docker exec，远程机器走 ssh，本机直接跑。"""
+        if t["kind"] == "docker":
+            return self.exec_argv(t["host"], ["docker", "exec", t["container"]] + list(argv))
+        return self.exec_argv(t["host"], list(argv))
+
+    def install_target(self, t):
+        name = os.path.basename(self.wheel.path)
+        remote_path = "/tmp/" + name
+        host = t["host"]
+        if t["kind"] == "docker":
+            rc, out, err = self.r.run(self.exec_argv(host, ["docker", "cp", self.wheel.path,
+                                                             "%s:%s" % (t["container"], remote_path)]),
+                                       timeout=900)
+            if rc != 0:
+                say("docker cp 到 %s 失败：%s" % (t["container"], txt(err).strip()[-300:]))
+                return False
+            inst_path = remote_path
+        elif t["kind"] == "ssh":
+            rc, out, err = self.r.run(["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", self.wheel.path,
+                                       "%s:%s" % (host, remote_path)], timeout=900)
+            if rc != 0:
+                say("scp 到 %s 失败：%s" % (host, txt(err).strip()[-300:]))
+                return False
+            inst_path = remote_path
+        else:
+            inst_path = self.wheel.path
+        cmds = [[t["py"], "-m", "pip", "install", "--no-deps", "--force-reinstall", inst_path],
+                [t["py"], "-m", "yee", "install-hook"],
+                [t["py"], "-m", "yee", "config", "--json"]]
+        for i, c in enumerate(cmds):
+            rc, out, err = self.r.run(self.target_argv(t, c), timeout=1800)
+            if rc != 0:
+                say("命令失败（退出码 %d）：%s %s" % (rc, " ".join(c), txt(err).strip()[-300:]))
+                return False
+            if i == len(cmds) - 1:
+                try:
+                    json_tail(txt(out))
+                except ValueError:
+                    say("yee config --json 的返回解析不了：%s" % txt(out).strip()[-300:])
+                    return False
+        return True
+
+    def uninstall_target(self, t):
+        ok = True
+        for c in ([t["py"], "-m", "yee", "uninstall-hook"], [t["py"], "-m", "pip", "uninstall", "-y", "yee"]):
+            rc, out, err = self.r.run(self.target_argv(t, c), timeout=900)
+            if rc != 0:
+                say("卸载命令失败（退出码 %d）：%s" % (rc, " ".join(c)))
+                ok = False
+        return ok
+
+    def say_container_persist(self, t):
+        name = os.path.basename(self.wheel.path)
+        say("容器 %s 重建以后会丢，持久做法二选一：" % t["container"])
+        say("  1) 镜像里装：构建镜像时 pip install %s && python -m yee install-hook" % name)
+        say("  2) 挂载 + 环境变量：-v /opt/yee:/opt/yee -e PYTHONPATH=/opt/yee")
+
+    def restart_generic(self, targets):
+        seen, containers = set(), []
+        for t in targets:
+            if t["kind"] != "docker":
+                continue
+            key = (t["host"], t["container"])
+            if key in seen:
+                continue
+            seen.add(key)
+            containers.append(t)
+        if containers:
+            if not self.confirm("现在重启这些容器：%s？" % "、".join(t["container"] for t in containers)):
+                say("已取消重启")
+                return
+            for t in containers:
+                rc, out, err = self.r.run(self.exec_argv(t["host"], ["docker", "restart", t["container"]]),
+                                           timeout=900)
+                say("docker restart %s：退出码 %d" % (t["container"], rc))
+        if self.a.restart_cmd:
+            argv = shlex.split(self.a.restart_cmd)
+            if argv:
+                rc, out, err = self.r.run(argv, timeout=1800)
+                say("--restart-cmd 执行完毕（退出码 %d）：%s" % (rc, self.a.restart_cmd))
+                if txt(out).strip():
+                    say(txt(out).strip()[-500:])
+        others = [t for t in targets if t["kind"] != "docker"]
+        if others:
+            say("其余目标用你原来的方式重启该服务，然后运行 python -m yee doctor：%s"
+                % "、".join(t["label"] for t in others))
+
+    def generic_mode(self):
+        discover, plan_mod = self.load_modules()
+        instances = self.collect_instances(discover)
+        say("发现 %d 个实例" % len(instances))
+        targets, failures = [], []
+        if not self.a.check:
+            targets, skipped = self.classify(instances)
+            for why in skipped:
+                say("跳过：" + why)
+            done = set()
+            for t in targets:
+                if t["key"] in done:
+                    continue
+                done.add(t["key"])
+                say("目标：%s（解释器 %s）" % (t["label"], t["py"]))
+                if self.a.uninstall:
+                    ok = self.uninstall_target(t)
+                else:
+                    ok = self.install_target(t)
+                    if ok and t["kind"] == "docker":
+                        self.say_container_persist(t)
+                if not ok:
+                    failures.append(t["label"])
+        plan = plan_mod.analyze(instances)
+        print(plan_mod.render(plan))
+        out_path = self.a.plan_out or "yee-plan.json"
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(plan, f, ensure_ascii=False, indent=2)
+            say("诊断结果已写 %s" % os.path.abspath(out_path))
+        except OSError as e:
+            say("写 %s 失败：%s" % (out_path, e))
+        if self.a.restart and not self.a.check:
+            self.restart_generic(targets)
+            again = self.collect_instances(discover)
+            plan = plan_mod.analyze(again)
+            summary = plan.get("summary") or {}
+            say("重启后再看：可加速 %s · 要改参数 %s · 要打补丁 %s · 不支持 %s · 无需处理 %s"
+                % (summary.get("accelerated", 0), summary.get("needs_change", 0), summary.get("needs_patch", 0),
+                   summary.get("unsupported", 0), summary.get("not_needed", 0)))
+        if failures:
+            say("有 %d 个目标没装成功：%s" % (len(failures), "、".join(failures)))
+            return 1
+        try:
+            return int(plan.get("exit", 0))
+        except (TypeError, ValueError):
+            return 0
 
     # -------------------------------------------------- mia mode: discovery
     def source_env(self):
@@ -501,7 +831,7 @@ class Installer:
 
         explicit = [(k, v) for k, v in self.extra.items() if YEE_KEY_RE.match(k) and k != "YEE"]
         if explicit:
-            say("EXTRA_CONTAINER_ENV 里显式设置的 Yee 相关项会覆盖 4.2 的默认值：%s"
+            say("EXTRA_CONTAINER_ENV 里显式设置的 Yee 相关项会覆盖 4.3 的默认值：%s"
                 % " ".join("%s=%s" % (k, mask(k, v)) for k, v in explicit))
         if self.extra.get("YEE") not in (None, "", "1"):
             say("EXTRA_CONTAINER_ENV 里有 YEE=%s，标记块里的 YEE=1 会覆盖它" % self.extra.get("YEE"))
@@ -817,27 +1147,39 @@ class Installer:
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="install.sh", description="Yee 一键安装")
+    p = argparse.ArgumentParser(prog="install.sh", description="Yee 一键安装（4.3）：Mia 方案或任何部署都能装")
     p.add_argument("--recipe", help="Mia 方案目录（含 start.sh 与 .env.tp4 / .env）")
     p.add_argument("--env-file", help="env 文件（缺省：方案目录下的 .env.tp4 或 .env）")
     p.add_argument("--wheel", help="yee wheel（缺省：脚本目录里唯一的 yee-*.whl）")
-    p.add_argument("--check", action="store_true", help="只检查，不写任何东西")
-    p.add_argument("--restart", action="store_true", help="装完重启服务，健康检查 + 冒烟，失败自动回退")
-    p.add_argument("--uninstall", action="store_true", help="删掉 env 文件里的 Yee 标记块")
+    p.add_argument("--check", action="store_true", help="只检查/诊断，不写任何东西")
+    p.add_argument("--restart", action="store_true", help="装完重启服务（generic 模式重启 docker 容器），再诊断一次")
+    p.add_argument("--uninstall", action="store_true", help="卸载（删掉 env 文件里的 Yee 标记块 / 卸载各目标）")
     p.add_argument("--purge", action="store_true", help="与 --uninstall 一起用：再删掉各台机器的安装目录")
     p.add_argument("--no-vcap", action="store_true", help="不放逐请求 conf（mia-dsv41-vcap）的两个文件")
-    p.add_argument("--dir-name", help="安装目录名（缺省 yee+主次版本号，如 yee42）")
+    p.add_argument("--dir-name", help="安装目录名（缺省 yee+主次版本号，如 yee43）")
     p.add_argument("--cache-root-override", help="测试用：各台机器都装到这个路径下，而不是 $HOME/.cache")
     p.add_argument("--base-pythonpath", help="镜像 PYTHONPATH 读不到时用这个值")
     p.add_argument("--yes", action="store_true", help="不询问")
-    p.add_argument("--mode", choices=("auto", "mia", "pip"), default="auto")
+    p.add_argument("--mode", choices=("auto", "mia", "generic", "pip"), default="auto",
+                   help="auto：找到 Mia 方案走 Mia 模式，否则走 generic 模式；pip：只装进当前 Python")
     p.add_argument("--python", help="pip 模式用的 Python（缺省当前解释器）")
     p.add_argument("--timeout-min", default="40", help="重启后等待就绪的上限（分钟，缺省 40）")
+    p.add_argument("--pip", action="store_true", help="强制走老路径：只装进当前 Python（generic 模式不装）")
+    p.add_argument("--cmd", action="append", help="generic 模式：按这条启动命令解析实例（可多次）")
+    p.add_argument("--url", action="append", help="generic 模式：探测这个服务地址（可多次）")
+    p.add_argument("--hosts", action="append", help="generic 模式：逗号分隔的机器列表（如 h1,h2），ssh 过去看/装")
+    p.add_argument("--config", action="append", help="generic 模式：Maya JSON 启动配置（可多次）")
+    p.add_argument("--no-docker", action="store_true", help="generic 模式：不看 docker 容器")
+    p.add_argument("--k8s", action="store_true", help="generic 模式：读 kubectl（只看，不改集群）")
+    p.add_argument("--restart-cmd", help="generic 模式：--restart 时在本机执行的重启命令")
+    p.add_argument("--plan-out", help="generic 模式：诊断 JSON 的输出路径（缺省 ./yee-plan.json）")
     return p
 
 
-def main(argv=None, runner=None):
+def main(argv=None, runner=None, modules=None):
     args = build_parser().parse_args(argv)
+    if args.pip and args.mode in ("auto", "generic"):
+        args.mode = "pip"
     if args.mode == "mia" and not args.recipe:
         found = find_recipes(os.path.dirname(os.path.abspath(__file__)))
         if len(found) != 1:
@@ -845,7 +1187,7 @@ def main(argv=None, runner=None):
             return 1
         args.recipe = found[0]
     try:
-        return Installer(args, runner).main()
+        return Installer(args, runner, modules=modules).main()
     except Abort as e:
         say("错误：%s" % e)
         return e.code

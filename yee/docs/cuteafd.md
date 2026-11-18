@@ -19,7 +19,7 @@ yee patch apply cuteafd --src <源码根> --variant v2
 | v1 | `recall.patch`（md5 `bed0372f9a4876ca0acfbe4032f3904e`，556 行） | `5ba977861b9cbbf3dac55673275bdb26b4bd0a49fe25a289d63ce332bcbda4c2` | `cuteafd-coordinator-recall:v3.0.0-r572`（`be48be7f7657`） |
 | v2 | `recall_v2.patch`（md5 `802a0a66470ef9cf6d15fa044ae3d98e`，657 行） | `15dedc5e076084b2affe173285f0a9c0819f52576dbfbda796e9a500b07cc0dc` | `cuteafd-coordinator-recall:v3.0.0-r572b`（`02f30431a01a`） |
 
-两个补丁都已在 ysy101 上对原样副本复验（PATCH-VERIFY PASS / PATCH2-VERIFY PASS）。
+两个补丁都已在隔离环境里对原样副本复验（PATCH-VERIFY PASS / PATCH2-VERIFY PASS）。
 
 ## 2. 重新编译
 

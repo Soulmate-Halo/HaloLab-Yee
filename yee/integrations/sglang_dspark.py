@@ -261,6 +261,14 @@ def _maybe_log(eng) -> None:
              _counts["own"], st["landed_tokens"], st["offers"], st["probes"], st["ids"], st["active_streams"],
              _state["paused"], _counts["plan_errors"] + _counts["account_errors"], _counts["budget_calls"],
              _counts["budget_hot_rows"], _counts["sts_rows"]), flush=True)
+    try:  # 4.3: [yee] effect: lines (is recall paying off here, and what to change if not)
+        from . import plan as _plan
+
+        _plan.effect_tick(_state, {"steps": _counts["steps"], "rows": _counts["rows"], "used": _counts["used"],
+                                   "own": _counts["own"], "landed": st["landed_tokens"], "offers": st["offers"],
+                                   "errors": _counts["plan_errors"] + _counts["account_errors"]})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _pool_idx(req):

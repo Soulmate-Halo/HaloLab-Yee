@@ -37,7 +37,7 @@ from .core import (  # noqa: F401
     tokenizer_identity,
 )
 
-__version__ = "4.2.0"
+__version__ = "4.3.0"
 
 __all__ = [
     "RecallRecord", "RecallEngine", "Proposal", "tokenizer_identity", "engine_from_env", "get_engine",

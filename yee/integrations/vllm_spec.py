@@ -304,6 +304,14 @@ def _maybe_log(eng) -> None:
           % (TAG, _counts["steps"], _counts["rows"], _counts["plan_rows"], _counts["used"], _counts["fallback"],
              _counts["own"], st["landed_tokens"], st["offers"], st["ids"], st["active_streams"],
              len(_state["pending"]), _state["paused"], _counts["errors"]), flush=True)
+    try:  # 4.3: [yee] effect: lines (is recall paying off here, and what to change if not)
+        from . import plan as _plan
+
+        _plan.effect_tick(_state, {"steps": _counts["steps"], "rows": _counts["rows"], "used": _counts["used"],
+                                   "own": _counts["own"], "landed": st["landed_tokens"], "offers": st["offers"],
+                                   "errors": _counts["errors"]})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ------------------------------------------------------------------------------------------- runner views
