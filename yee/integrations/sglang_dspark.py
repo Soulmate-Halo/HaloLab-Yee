@@ -32,6 +32,7 @@ import time
 import numpy as np
 
 from ..core import ENV_NEW, ENV_OLD, _env
+from .. import tree as _tree
 
 O_MAX = 6  # gamma=5 values, kept for the tests; live code uses _omax(gamma) / _pad(gamma)
 PAD = 7
@@ -42,6 +43,9 @@ _TRUE = ("1", "true", "yes", "on")
 _state = {
     "engine": None, "engine_failed": False, "group": None, "pinned": None, "slot": 0, "worker": None,
     "paused": False, "pause_t": 0.0, "log_t": 0.0, "installed": False,
+    # 4.0: rank0 only. Pool rows (Req.req_pool_idx) that carried a recall plan in the latest launched step.
+    # Replaced as a whole object (never mutated) because the scheduler thread reads it in compute_budget.
+    "recall_hot": frozenset(),
 }
 _fifo: dict = {}  # rid -> deque of (rid, flag, L, W list | None, real); one entry per launched step
 _counts = collections.Counter()
@@ -86,7 +90,7 @@ def build_plan(engine, reqs, gamma: int, paused: bool = False):
             if k < n_out:
                 engine.extend_stream(rid, out[k:])
             if not paused:
-                prop = engine.propose(rid, n=W - 1)
+                prop = _tree.propose(engine, rid, n=W - 1)
                 if prop is not None:
                     plan[i, 0] = 1
                     plan[i, 1] = L
@@ -252,10 +256,60 @@ def _maybe_log(eng) -> None:
     _state["log_t"] = now
     st = eng.stats()
     print("[recall] steps=%d rows=%d plan_rows=%d used=%d fallback=%d own=%d landed=%d offers=%d probes=%d "
-          "record_ids=%d streams=%d paused=%s errors=%d"
+          "record_ids=%d streams=%d paused=%s errors=%d budget_calls=%d budget_hot_rows=%d sts_rows=%d"
           % (_counts["steps"], _counts["rows"], _counts["plan_rows"], _counts["used"], _counts["fallback"],
              _counts["own"], st["landed_tokens"], st["offers"], st["probes"], st["ids"], st["active_streams"],
-             _state["paused"], _counts["plan_errors"] + _counts["account_errors"]), flush=True)
+             _state["paused"], _counts["plan_errors"] + _counts["account_errors"], _counts["budget_calls"],
+             _counts["budget_hot_rows"], _counts["sts_rows"]), flush=True)
+
+
+def _pool_idx(req):
+    """The req_to_token row of a request, or None. SGLang keeps it flat on the Req in some trees and under
+    ``Req.kv`` (ReqKvInfo) in others; both are the same number."""
+    idx = getattr(req, "req_pool_idx", None)
+    if idx is None:
+        kv = getattr(req, "kv", None)
+        if kv is not None:
+            idx = getattr(kv, "req_pool_idx", None)
+    return idx
+
+
+def _hot_rows(reqs, flags) -> frozenset:
+    """Pool rows (Req.req_pool_idx) of the requests whose plan row is set; rows without a pool index are skipped."""
+    hot = []
+    for req, flag in zip(reqs, flags):
+        if not flag:
+            continue
+        idx = _pool_idx(req)
+        if idx is None:
+            continue
+        try:
+            hot.append(int(idx))
+        except (TypeError, ValueError):
+            continue
+    return frozenset(hot)
+
+
+def budget_hook_enabled() -> bool:
+    return os.environ.get("YEE_RECALL_BUDGET", "1").strip().lower() in _TRUE
+
+
+def recall_aware_confidence(confidence, req_pool_indices_cpu, hot):
+    """4.0: the budget planner sees the confidence of two steps ago, so a request that has just started to copy
+    is budgeted at its old (low) confidence while the row allocation already treats it as certain. Returns
+    ``confidence`` itself when nothing changes, otherwise a clone whose rows for pool rows in ``hot`` are 1.0."""
+    if not hot or confidence is None or getattr(confidence, "dim", lambda: 0)() != 2:
+        return confidence, 0
+    try:
+        pools = [int(x) for x in req_pool_indices_cpu.tolist()]
+    except Exception:  # noqa: BLE001
+        return confidence, 0
+    rows = [i for i, p in enumerate(pools[: int(confidence.shape[0])]) if p in hot]
+    if not rows:
+        return confidence, 0
+    out = confidence.clone()
+    out[rows, :] = 1.0
+    return out, len(rows)
 
 
 # ------------------------------------------------------------------------------------------- hooks
@@ -282,7 +336,36 @@ def _participates(kw, out) -> bool:
         if cl is None or cl.dim() != 3 or int(cl.shape[0]) < int(bs):
             return False
     dt = getattr(dblk, "draft_tokens", None)
-    return dt is not None and dt.dim() == 2 and dt.shape[0] == int(bs)
+    if not (dt is not None and dt.dim() == 2 and dt.shape[0] == int(bs)):
+        return False
+    return _ranks_agree()
+
+
+_RANK = {"ok": None}
+
+
+def _ranks_agree() -> bool:
+    """4.2: one store-based check per process, at the first step that would broadcast (the same step on every rank).
+    Off when some TP rank has no Yee (or another version): then no rank broadcasts and serving goes on as usual."""
+    ok = _RANK["ok"]
+    if ok is not None:
+        return ok
+    try:
+        from . import rank_agree
+
+        ranks, me = rank_agree.tp_ranks()
+        if ranks is None:
+            ok, why = True, "not distributed"
+        else:
+            ok, why = rank_agree.agree("dspark", ranks, me, float(os.environ.get("YEE_RANK_CHECK_S", "60")))
+    except Exception as e:  # noqa: BLE001
+        ok, why = False, "rank check error: %r" % (e,)
+    _RANK["ok"] = ok
+    if ok:
+        print("[recall] rank check on: %s" % why, flush=True)
+    else:
+        print("[recall] rank check off: %s; copies stay off on every rank" % why, flush=True)
+    return ok
 
 
 def _pinned(width: int):
@@ -314,6 +397,7 @@ def _on_propose(worker, kw, out) -> None:
     if rank0:
         eng = _get_engine(gamma)
         entries = None
+        hot = frozenset()
         try:
             if eng is not None:
                 arr, entries = build_plan(eng, batch.reqs, gamma, paused=_check_pause(eng))
@@ -322,12 +406,15 @@ def _on_propose(worker, kw, out) -> None:
                     host[:bs].copy_(torch.from_numpy(arr))
                     plan.copy_(host[:bs], non_blocking=True)
                     _counts["plan_rows"] += int(arr[:, 0].sum())
+                    hot = _hot_rows(batch.reqs, arr[:, 0].tolist())
         except Exception as e:  # noqa: BLE001  never skip the broadcast below
             _counts["plan_errors"] += 1
             if _counts["plan_errors"] <= 3:
                 print("[recall] plan error (zero plan this step): %r" % (e,), flush=True)
             entries = None
+            hot = frozenset()
             plan.zero_()
+        _state["recall_hot"] = hot
         if eng is not None:
             if entries is None:
                 entries = [(r.rid, 0, 0, None, 0) for r in batch.reqs]
@@ -437,10 +524,115 @@ def _patch_dspark_model_module(module) -> None:
     print("[recall] patched %s" % module.__name__, flush=True)
 
 
+def _patch_planner_module(module) -> None:
+    """4.0: recall-aware verify budget for compact verify (see ``recall_aware_confidence``). Only rank0's budget
+    matters (r658 broadcasts TP0's budget), and only rank0 fills ``recall_hot``."""
+    cls = getattr(module, "HostConfidenceBudgetPlanner", None)
+    if cls is None or not hasattr(cls, "compute_budget"):
+        print("[recall] %s has no HostConfidenceBudgetPlanner.compute_budget; budget hook off" % module.__name__,
+              flush=True)
+        return
+    orig = cls.compute_budget
+    if getattr(orig, "__recall_wrapped__", False):
+        return
+
+    def compute_budget(self, *a, **kw):
+        _counts["budget_calls"] += 1
+        hot = _state["recall_hot"]
+        if hot and budget_hook_enabled() and not a and "confidence" in kw and "req_pool_indices_cpu" in kw:
+            conf, n = recall_aware_confidence(kw["confidence"], kw["req_pool_indices_cpu"], hot)
+            if n:
+                _counts["budget_hot_rows"] += n
+                kw = dict(kw, confidence=conf)
+        return orig(self, *a, **kw)
+
+    compute_budget.__recall_wrapped__ = True
+    cls.compute_budget = compute_budget
+    print("[recall] planner budget hook installed (%s, YEE_RECALL_BUDGET=%s)"
+          % (module.__name__, os.environ.get("YEE_RECALL_BUDGET", "1")), flush=True)
+
+
+def sts_collect_path() -> str:
+    return os.environ.get("YEE_STS_COLLECT_PATH", "").strip()
+
+
+def _sts_collect_step(path: str, kw) -> None:
+    """4.0: STS labels under folded proposals (the engine's own SGLANG_DSPARK_STS_COLLECT_PATH skips every folded
+    step, and the eager proposal path of DSV4 with block 7 dies in the confidence head). rank0 only. The
+    confidence passed to observe_verify_step is sigmoid(raw / 1) when no STS table is loaded, so raw = logit(c).
+    Rows that carried a recall plan this step are skipped (their drafts are recall tokens, their confidence is
+    the drafter's). Labels: correct_len = accepted drafts; collect on a verify-all schedule (no SPS table) so they
+    are not capped."""
+    group = _state["group"]
+    if group is None or getattr(group, "rank_in_group", 1) != 0:
+        return
+    conf = kw.get("confidence")
+    cl = kw.get("correct_len")
+    bs = int(kw.get("bs") or 0)
+    if conf is None or cl is None or bs <= 0 or conf.dim() != 2:
+        return
+    import torch
+
+    conf = conf[:bs].detach().float()
+    raw = torch.logit(conf.clamp(1e-6, 1.0 - 1e-6))
+    cnt = cl[:bs].detach().to(torch.int64)
+    hot = _state["recall_hot"]
+    pools = kw.get("req_pool_indices")
+    if hot and pools is not None:
+        pl = [int(x) for x in pools[:bs].tolist()]
+        keep = [i for i, p in enumerate(pl) if p not in hot]
+        _counts["sts_skipped_recall"] += bs - len(keep)
+        if not keep:
+            return
+        if len(keep) < bs:
+            idx = torch.tensor(keep, dtype=torch.int64, device=raw.device)
+            raw = raw.index_select(0, idx)
+            cnt = cnt.index_select(0, idx.to(cnt.device))
+    rec = _state.get("sts_recorder")
+    if rec is None:
+        from sglang.srt.speculative.dspark_components.dspark_sts import StsDataRecorder
+
+        rec = _state["sts_recorder"] = StsDataRecorder(path_stem=path, gamma=int(raw.shape[1]), flush_every=64)
+        print("[recall] STS collector armed: %s.<n>.pt (gamma=%d, folded proposals, recall rows skipped)"
+              % (path, int(raw.shape[1])), flush=True)
+    rec.record(confidence_raw=raw, num_correct_drafts=cnt)
+    _counts["sts_rows"] += int(raw.shape[0])
+
+
+def _patch_observability_module(module) -> None:
+    cls = getattr(module, "DsparkStepObservers", None)
+    if cls is None or not hasattr(cls, "observe_verify_step"):
+        print("[recall] %s has no DsparkStepObservers.observe_verify_step; STS collector off" % module.__name__,
+              flush=True)
+        return
+    orig = cls.observe_verify_step
+    if getattr(orig, "__recall_wrapped__", False):
+        return
+
+    def observe_verify_step(self, *a, **kw):
+        ret = orig(self, *a, **kw)
+        path = sts_collect_path()
+        if path and not a:
+            try:
+                _sts_collect_step(path, kw)
+            except Exception as e:  # noqa: BLE001  never take serving down
+                _counts["sts_errors"] += 1
+                if _counts["sts_errors"] <= 3:
+                    print("[recall] STS collect error: %r" % (e,), flush=True)
+        return ret
+
+    observe_verify_step.__recall_wrapped__ = True
+    cls.observe_verify_step = observe_verify_step
+    print("[recall] observability hook installed (%s, YEE_STS_COLLECT_PATH=%s)"
+          % (module.__name__, sts_collect_path() or "-"), flush=True)
+
+
 TARGETS = {
     "sglang.srt.speculative.dspark_components.dspark_worker_v2": _patch_worker_module,
     "sglang.srt.managers.scheduler_components.batch_result_processor": _patch_processor_module,
     "sglang.srt.models.deepseek_v4_dspark": _patch_dspark_model_module,
+    "sglang.srt.speculative.dspark_components.dspark_planner": _patch_planner_module,
+    "sglang.srt.speculative.dspark_components.dspark_observability": _patch_observability_module,
 }
 
 

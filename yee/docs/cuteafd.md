@@ -39,16 +39,16 @@ Rust 1.98.1，与 `scripts/build/host-isa.sh` 的 release 命令一致。增量�
 
 ## 3. 开关与控制目录
 
-控制目录：容器内 `CUTEAFD_RECALL_DIR`，默认 `/run/cuteafd/bench/recall`，对应宿主机 `/home/ysy101/.cache/cuteafd/bench/recall`（服务启动后自动创建）。
+控制目录：容器内 `CUTEAFD_RECALL_DIR`，默认 `/run/cuteafd/bench/recall`，对应宿主机 `$HOME/.cache/cuteafd/bench/recall`（服务启动后自动创建）。
 
 | 操作 | 命令（宿主机） | 生效 |
 |---|---|---|
-| 开 | `touch /home/ysy101/.cache/cuteafd/bench/recall/enabled` | ≤1 秒，首次开启时分配内存 |
-| 关 | `rm /home/ysy101/.cache/cuteafd/bench/recall/enabled` | ≤1 秒，释放内存、历史清空 |
-| 清空历史 | `touch /home/ysy101/.cache/cuteafd/bench/recall/clear.request` | ≤1 秒，文件自动删除 |
-| 调 prior（v2） | `echo 0.95 > /home/ysy101/.cache/cuteafd/bench/recall/prior`（0.5–0.999，非法值用默认 0.98） | ≤1 秒 |
+| 开 | `touch $HOME/.cache/cuteafd/bench/recall/enabled` | ≤1 秒，首次开启时分配内存 |
+| 关 | `rm $HOME/.cache/cuteafd/bench/recall/enabled` | ≤1 秒，释放内存、历史清空 |
+| 清空历史 | `touch $HOME/.cache/cuteafd/bench/recall/clear.request` | ≤1 秒，文件自动删除 |
+| 调 prior（v2） | `echo 0.95 > $HOME/.cache/cuteafd/bench/recall/prior`（0.5–0.999，非法值用默认 0.98） | ≤1 秒 |
 | 容量 | 开启前写 `capacity` 文件（token 数，1048576–134217728），默认 16777216 | 下次开启时读 |
-| 统计 | `cat /home/ysy101/.cache/cuteafd/bench/recall/stats.json` | 每秒刷新 |
+| 统计 | `cat $HOME/.cache/cuteafd/bench/recall/stats.json` | 每秒刷新 |
 
 **开关是控制目录里的 `enabled` 文件**，不是环境变量；删掉它就等于关掉功能，不用重启。
 

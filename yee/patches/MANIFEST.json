@@ -1,6 +1,6 @@
 {
  "format": 1,
- "package": "yee 2.2.0",
+ "package": "yee 4.0.0",
  "bases": {
   "tensorfold": {
    "file": "tensorfold/0001-recall-after-priced.patch",
@@ -64,6 +64,183 @@
    ],
    "env": {},
    "summary": "DSpark Recall for greedy and sampled requests, 8/4-token short-window fallback; rebuild mlx-serve after the copy"
+  },
+  "mlx-serve-2.4": {
+   "kind": "source-drop",
+   "baseline": "M5 xypd mlx-serve live source with Yee 2.3 (r608 src_base; live binary sha16 1ff9c2a5df3f1829)",
+   "target": "src/engines/mlx/spec",
+   "files": [
+    {
+     "file": "mlx-serve-2.4/files/src/engines/mlx/spec/d_recall.zig",
+     "sha256": "10e2366162c7de6706a3f5886a4f71d84ea62d847e32dd2030b38c956f7b220a",
+     "dest": "src/engines/mlx/spec/d_recall.zig"
+    },
+    {
+     "file": "mlx-serve-2.4/files/src/engines/mlx/spec/d_recall_live.zig",
+     "sha256": "a3eea8b3c6e8638cb3b2b3ca63cc29d345f34e492de678afe96578b09e6ed663",
+     "dest": "src/engines/mlx/spec/d_recall_live.zig"
+    },
+    {
+     "file": "mlx-serve-2.4/files/src/engines/mlx/spec/d_recall_cold.zig",
+     "sha256": "0ac2a827edc2de41fd0b67659f149fd8ee83315395ff1cceaaa610ab075f3a0d",
+     "dest": "src/engines/mlx/spec/d_recall_cold.zig"
+    },
+    {
+     "file": "mlx-serve-2.4/files/src/env.zig",
+     "sha256": "87d1e7e9de6a17327cce546a50acf742796f7765aa4c344817190f6f5a19c3b5",
+     "dest": "src/env.zig"
+    }
+   ],
+   "env": {
+    "MLX_SERVE_D_RECALL_COLD_DIR": "<cold-layer directory on NVMe; unset or empty = 2.3 behaviour>"
+   },
+   "built": "mlx-serve.r608-v24, sha16 530781ec80c411bb, version 26.11.1-xypd-v24",
+   "rebuild": "zig build check; zig build test -Dtest-filter=d_recall (113/113) and dspark (73/73); zig build -Doptimize=ReleaseFast",
+   "summary": "Yee 2.4 cold layer: tokens.bin + index.bin on NVMe written by one background thread, each round prefetches the next round's 3 branches, the inference thread only does non-blocking reads; M5 A/B aggregate decode -0.4852% on average, hit rate +4.79/+10.13/+4.36 points, 0 errors"
+  },
+  "tensorfold-kad": {
+   "file": "tensorfold/0002-kad.patch",
+   "sha256": "24b6746c23827953cc6954aa927a541d36c5b6122a0e9c55262b36fc62cd67dc",
+   "kind": "git-patch",
+   "baseline": "ashhart/TensorFold commit 33ada77c3122fca844a6825316ce8bbabaca05be with tensorfold/0001-recall-after-priced.patch applied (apply the tensorfold base first)",
+   "apply_in": "repository root (git apply)",
+   "env": {
+    "TF_KAD": "1"
+   },
+   "rebuild": "zig build with the repository's .zig-version (0.17.0); DeepSeek V4.1 launch width 12: \"dspark_block_size\": 12 in the model's config.json",
+   "summary": "KAD: per-stream head draft depth 5..12 within cfg.most_drafts (ladder, hot-reloaded policy file, Recall hits widen); TF_KAD=1 or YEE_KAD=1, unset = the 0001 behaviour"
+  },
+  "llama.cpp-kad": {
+   "file": "llama.cpp-kad/0001-kad.patch",
+   "sha256": "dfcdd89c485f209ce4d9e719979282bc7f227cb705ffeb5adc33ec7b77ecc25c",
+   "kind": "git-patch",
+   "baseline": "ggml-org/llama.cpp v0.9.0 commit cd959bae99ff4bed22bef2604f45241c09bbb8c8",
+   "apply_in": "repository root (git apply or patch -p1)",
+   "env": {
+    "LLAMA_ARG_KAD": "1"
+   },
+   "rebuild": "cmake --build build --target llama-server",
+   "summary": "llama-server KAD: per-slot draft count 5..12 within --spec-draft-n-max (draft-simple, EAGLE3, MTP; ngram types native); --kad / LLAMA_ARG_KAD=1 / YEE_KAD=1, --kad-policy; unset = upstream"
+  },
+  "mlx-serve-kad": {
+   "kind": "source-drop",
+   "baseline": "mlx-serve-2.4 copied onto the M5 xypd live source (r608 src_base: dspark.zig sha256 30412c8bd5a1e1b2..., dspark_group.zig c37b03e31a08b678...); copy mlx-serve-2.4 first",
+   "target": "src/engines/mlx/spec",
+   "files": [
+    {
+     "file": "mlx-serve-kad/files/src/engines/mlx/spec/d_recall.zig",
+     "sha256": "a4346a1637d44591b86448a092c13004a5b06a4df8bdb9f1ac52d3d25645a1b1",
+     "dest": "src/engines/mlx/spec/d_recall.zig"
+    },
+    {
+     "file": "mlx-serve-kad/files/src/engines/mlx/spec/dspark.zig",
+     "sha256": "faa7368926faf0a4ae089049eb356462f3b1a5506c1d62d27e32621dcc753fb1",
+     "dest": "src/engines/mlx/spec/dspark.zig"
+    },
+    {
+     "file": "mlx-serve-kad/files/src/engines/mlx/spec/dspark_group.zig",
+     "sha256": "8ba6a1ecba4268e647fc26a3ab3520694f4de3a7a4bd99822c9a836e13c20af3",
+     "dest": "src/engines/mlx/spec/dspark_group.zig"
+    },
+    {
+     "file": "mlx-serve-kad/files/src/engines/mlx/spec/kad.zig",
+     "sha256": "76f305c0dc030041720f178d92cc0adb772ec4c36f3e082cd58d6438ce17b2a5",
+     "dest": "src/engines/mlx/spec/kad.zig"
+    },
+    {
+     "file": "mlx-serve-kad/files/src/engines/mlx/spec/kad_live.zig",
+     "sha256": "96655f83c3b1ef41e52240ca036f4939fa48f14d84c38771d21330b587c3ca29",
+     "dest": "src/engines/mlx/spec/kad_live.zig"
+    },
+    {
+     "file": "mlx-serve-kad/files/src/engines/mlx/spec/kad_stdio.zig",
+     "sha256": "feba363c9106d024534932dc8d46c8f0468d4d7a628ab4cdb8dee6b18fe83bc1",
+     "dest": "src/engines/mlx/spec/kad_stdio.zig"
+    }
+   ],
+   "env": {
+    "MLX_SERVE_KAD": "1"
+   },
+   "rebuild": "zig build check; zig build test -Dtest-filter=d_recall, -Dtest-filter=dspark and -Dtest-filter=kad; zig build -Doptimize=ReleaseFast",
+   "summary": "DSpark KAD: a stage round verifies at most the request's width 5..12 within dspark_block_size (12 in the model's config.json); copy and recall rounds teach the ladder; MLX_SERVE_KAD=1 or YEE_KAD=1, unset = 2.4 behaviour"
+  },
+  "llama.cpp-recall": {
+   "file": "llama.cpp-recall/0002-recall.patch",
+   "sha256": "203d4fe4e5d3c2251d823b3f574bf133baa9fde87423ef73cbc145587bd98024",
+   "kind": "git-patch",
+   "baseline": "ggml-org/llama.cpp v0.9.0 commit cd959bae99ff4bed22bef2604f45241c09bbb8c8 with llama.cpp-kad/0001-kad.patch applied (apply llama.cpp-kad first)",
+   "apply_in": "repository root (git apply or patch -p1), after llama.cpp-kad/0001-kad.patch",
+   "env": {
+    "LLAMA_ARG_RECALL": "1"
+   },
+   "rebuild": "cmake --build build --target llama-server",
+   "summary": "llama-server Yee recall: cross-request copy drafts (common/recall.{h,cpp}, C++ port of yee.core RecallRecord + RecallEngine, memory or disk record), with or without a draft model; a recall proposal makes KAD hot (width 12); --recall / LLAMA_ARG_RECALL=1 / RECALL_ACCEL=1, --recall-dir, --recall-read-only, --recall-gib, --recall-n; unset = llama.cpp-kad behaviour"
+  },
+  "mia-dsv41-vcap": {
+   "kind": "source-drop",
+   "baseline": "SGLang Mia DeepSeek-V4.1 image (r652/r653 adapter): /opt/dsv41/adapter/verify_cap.py sha256 949c3fb72d72b48e... with DSV41_VERIFY_CAP already set",
+   "target": ".",
+   "files": [
+    {
+     "file": "mia-dsv41-vcap/files/verify_cap.py",
+     "sha256": "9463b384717aaf3ee6867d2ed16f5284ed2bf56327aec54b9dcba8658a277b62",
+     "dest": "verify_cap.py"
+    },
+    {
+     "file": "mia-dsv41-vcap/files/vcap_policy.py",
+     "sha256": "7df4f8248698b4b31acc1013d0474c5bb040477fb4b2c6513d737eb129b7b197",
+     "dest": "vcap_policy.py"
+    }
+   ],
+   "env": {
+    "DSV41_VERIFY_CAP": "conf:0.1",
+    "DSV41_VCAP_CTL": "/state/vcap_ctl.json"
+   },
+   "summary": "per-request verify width for the DSpark verify rectangle: while the control file does not exist the decision is bit-identical to DSV41_VERIFY_CAP=conf:T; mode legacy only observes, mode adapt takes per-request thresholds from vcap_policy.VcapPolicy (load / req / pos / recall / temp / explore)"
+  },
+  "mia-dsv41-image-budget": {
+   "kind": "source-drop",
+   "baseline": "sglang srt/multimodal/deepseek_v41_image_processing.py sha256 dcd06c489aa12fec... (r662 eng/orig)",
+   "target": ".",
+   "files": [
+    {
+     "file": "mia-dsv41-image-budget/files/srt/multimodal/deepseek_v41_image_processing.py",
+     "sha256": "799fc67f46b2d763cc8f9635d98861a1fc358043c5b3c420e42aef77d34d63d5",
+     "dest": "srt/multimodal/deepseek_v41_image_processing.py",
+     "orig_sha256": "dcd06c489aa12fecf7a99925d010bb9929b408f834d7e277051bfc3dd41db0ba"
+    }
+   ],
+   "remove_after": [
+    "srt/multimodal/__pycache__/deepseek_v41_image_processing.*.pyc"
+   ],
+   "env": {
+    "XY_DSV41_IMAGE_BUDGET_RESERVE": "1"
+   },
+   "summary": "the image token budget of the decode side reserves the same token the vLLM prefill reserves, so a 3024x588 image is 886 tokens on both sides (1024 without the patch, the PD request fails with 500); 0 (default) = reference behaviour"
+  },
+  "strata-recall": {
+   "file": "strata-recall/0001-yee-recall.patch",
+   "sha256": "9a95807463ccf1f41c1c68bc29a72a195a3597d00a3bc71d72d18baf41855903",
+   "kind": "git-patch",
+   "baseline": "Niko1221/Strata commit 712fec6b4297c9cfd32ab43daaa2979a9aa01edf (engine 0.1.59); also applies on top of strata-0.1.59-expert-server.patch (rtx3080n1 /home/ubuntu/xp/strata-src)",
+   "apply_in": "repository root (git apply or patch -p1)",
+   "env": {
+    "RECALL_ACCEL": "1"
+   },
+   "rebuild": "CUDA build of the strata target (cmake -DSTRATA_ENABLE_CUDA=ON ..., cmake --build <dir> --target strata); rtx3080n1: /home/ubuntu/xp/build.sh, then copy build-*/strata to /home/ubuntu/xp/engine/strata",
+   "summary": "strata engine Yee recall: cross-request copy drafts (C++ port of yee.core RecallRecord + RecallEngine, memory or disk record) replace a window's MTP drafts when the record expects more landed tokens; single-stream GEN and batched BGEN slots; --recall / RECALL_ACCEL=1, unset = upstream; 3.6.0: replicas share one disk record (every replica appends under flock and refreshes every 2 s, STRATA_RECALL_SHARED=0 = the 3.5.x single writer) and a two-process unit test tests/yee_recall_shared_test.cpp"
+  },
+  "llama.cpp-mtp-vocab": {
+   "file": "llama.cpp-mtp-vocab/0001-yee-mtp-vocab.patch",
+   "sha256": "c66ebd0c4c0eaf9a6ece54028670ad637b5eac43df9452771c9cbb0a44c4ea9e",
+   "kind": "git-patch",
+   "baseline": "ggml-org/llama.cpp commit a3b9c23ead5054832c5ed4b43f652fa1123869a3 (2026-08-21); the two anchors in src/models/qwen35.cpp also occur once in v0.9.0 cd959bae",
+   "apply_in": "repository root (git apply or patch -p1)",
+   "env": {
+    "YEE_MTP_VOCAB_N": "131072"
+   },
+   "rebuild": "cmake --build build --target llama-server",
+   "summary": "llama.cpp MTP draft head (qwen35 / qwen35moe nextn graph) computes logits only for token ids [0, N) and pads them back to n_vocab with -1000; YEE_MTP_VOCAB_N=N, unset or 0 = upstream; drafts are verified by the target, the output does not change"
   }
  }
 }

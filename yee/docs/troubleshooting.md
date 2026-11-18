@@ -16,7 +16,10 @@ yee status            # 记录目录和 stats.json
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 日志没有 `[recall-accel]` 安装信息 | 钩子没装，或没打开 | 在服务的解释器里 `yee install-hook`；设 `RECALL_ACCEL=1`（或 `YEE=1`）后重启服务 |
+| 日志没有 `[recall-accel]` 安装信息 | 钩子没装，或被关掉 | Mia 方案用 `bash install.sh --check` 再 `bash install.sh --restart`；其它机器在服务的解释器里 `yee install-hook` 后重启服务。4.2 起开关默认打开，确认没有显式的 `YEE=0` / `RECALL_ACCEL=0` |
+| 召回统计 `[recall] steps=...` 停在很小的数不增长，或服务卡住 | 只有部分机器装了 Yee，或各台版本不同，TP rank 之间不一致 | 每台机器都装同一版本（`install.sh` 会做）；4.2 起会打印 `[recall] rank check on: N ranks` 或 `rank check off: <原因>`，off 时召回在所有 rank 上一起关闭，服务照常 |
+| 显式设置的旧环境变量覆盖了 4.2 的默认值 | env 文件或启动脚本里还留着以前设的 `YEE_*` / `RECALL_ACCEL_*` / `DSV41_RECALL*` 等 | 在容器里 `python3 -m yee config` 看每个开关的值与来源（env / default / off），删掉不需要的显式设置 |
+| 日志里有 `[yee-eb] rank check off` 或没有 `[yee-eb] armed geometry` | 热专家验证预算没起作用：部分 rank 没装，或 MoE 不在 `moe_b12x_next` 确定性路径上 | 见 [expert-budget.md](expert-budget.md) 的生效条件；其它加速不受影响 |
 | 日志里有 `RECALL_ACCEL_ADAPTER=off: no hooks` | 适配器被关掉 | 去掉 `RECALL_ACCEL_ADAPTER` 或设为 `auto` |
 | `doctor` 某一项 FAIL | 引擎版本改了符号或签名，钩子保持不生效以免出错 | 把 `doctor` 输出连同引擎版本一起反馈；服务照常运行，只是没加速 |
 | `auto` 显示 `status=unsupported` / `no-op` | 这个加速头不支持（如 SGLang FROZEN_KV_MTP、vLLM NGRAM / SUFFIX、EAGLE topk>1） | 见 [heads.md](heads.md)；SGLang 没有加速头时可改用 `--speculative-algorithm NGRAM` |

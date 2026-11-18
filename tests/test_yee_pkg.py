@@ -51,7 +51,7 @@ def test_compat_same_modules():
               "assert a is b\n"
               "assert sys.modules['recall_accel.integrations.sglang_dspark'] is "
               "sys.modules['yee.integrations.sglang_dspark']\n"
-              "assert recall_accel is yee and recall_accel.__version__ == '2.2.0'\n"
+              "assert recall_accel is yee and recall_accel.__version__ == '4.2.0'\n"
               "from recall_accel.core import RecallEngine\n"
               "import yee.core\n"
               "assert RecallEngine is yee.core.RecallEngine\n"
@@ -62,10 +62,14 @@ def test_compat_same_modules():
 
 @test
 def test_compat_autoload_old_name():
-    # the 2.x .pth line; with RECALL_ACCEL unset it must import quietly and install nothing
+    # the 2.x .pth line; with YEE=0 it must import quietly and install nothing (4.2: unset means on)
     out = _py("import sys, recall_accel.autoload as a, yee.autoload as b\n"
               "assert a is b and not a.enabled()\n"
-              "print('ok')")
+              "print('ok')", {"YEE": "0"})
+    assert out.endswith("ok"), out
+    out = _py("import os, recall_accel.autoload as a\n"
+              "assert a.enabled() and os.environ.get('YEE_EXPERT_BUDGET') == '1'\n"
+              "print('ok')", {"RECALL_ACCEL_ADAPTER": "off"})
     assert out.endswith("ok"), out
 
 
@@ -84,7 +88,7 @@ def test_yee_env_alias():
 @test
 def test_manifest_sha256():
     m = patches.load_manifest()
-    assert set(m["bases"]) == {"tensorfold", "cuteafd", "mlx-serve"}, sorted(m["bases"])
+    assert set(m["bases"]) == {"tensorfold", "cuteafd", "mlx-serve", "mlx-serve-2.4", "tensorfold-kad", "llama.cpp-kad", "mlx-serve-kad", "llama.cpp-recall", "mia-dsv41-vcap", "mia-dsv41-image-budget", "strata-recall", "llama.cpp-mtp-vocab"}, sorted(m["bases"])
     seen = set()
     for name, e in m["bases"].items():
         files = []
@@ -99,7 +103,8 @@ def test_manifest_sha256():
         assert patches.verify(files) == [], (name, patches.verify(files))
         seen.update(f["file"] for f in files)
     shipped = set()
-    for dp, _, fns in os.walk(patches.PATCH_DIR):
+    for dp, dns, fns in os.walk(patches.PATCH_DIR):
+        dns[:] = [d for d in dns if d != "__pycache__"]  # pip byte-compiles the .py files of source drops
         for fn in fns:
             rel = os.path.relpath(os.path.join(dp, fn), patches.PATCH_DIR).replace(os.sep, "/")
             if rel != "MANIFEST.json":
@@ -108,6 +113,8 @@ def test_manifest_sha256():
     assert m["bases"]["tensorfold"]["env"] == {"TF_RECALL_AFTER_PRICED": "1"}
     assert m["bases"]["cuteafd"]["default_variant"] == "v2"
     assert len(m["bases"]["mlx-serve"]["files"]) == 4
+    assert len(m["bases"]["mlx-serve-2.4"]["files"]) == 4
+    assert m["bases"]["mlx-serve-2.4"]["env"].keys() == {"MLX_SERVE_D_RECALL_COLD_DIR"}
 
 
 @test

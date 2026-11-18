@@ -13,6 +13,7 @@
   patch list|show|path|apply       source patches for TensorFold / cuteafd / mlx-serve
   doc [topic]                      the built-in manual (Chinese); no topic lists the topics
   bases [--json]                   base x speculative head support table
+  config                           every switch's effective value and its source (env / default / off)
 """
 from __future__ import annotations
 
@@ -381,23 +382,31 @@ def cmd_doc(args) -> int:
 
 STATIC_BASES = (
     {"base": "tensorfold", "head": "RECALL (native)", "adapter": "tensorfold", "status": "native",
-     "nongreedy": True, "shared": True,
+     "nongreedy": True, "shared": True, "tree": "none", "tree_note": "TensorFold's own Recall path; Yee 2.3.0 does not change it",
      "note": "TensorFold >= 1.0.12 has Recall built in: tensorfold serve MODEL --recall (yee tensorfold args); "
-             "sampled requests are lossless; the record is shared by every user of the machine"},
+             "sampled requests use the same verify path; the record is shared by every user of the machine"},
     {"base": "tensorfold", "head": "priced proposers (DSv4.1 lookup plan, Llama drafter, Qwen4 lanes)",
      "adapter": "patch 0001", "status": "patch", "nongreedy": True, "shared": True,
+     "tree": "none", "tree_note": "patch 0001 asks Recall after an empty priced proposer: one chain, unchanged",
      "note": "upstream never asks Recall when a priced proposer is empty: yee patch apply tensorfold --src DIR, "
              "rebuild, then TF_RECALL_AFTER_PRICED=1"},
     {"base": "tensorfold", "head": "Qwen4 / Kimi Metal / Drama / Flash Next on Mac", "adapter": None,
-     "status": "unsupported", "nongreedy": None, "shared": None,
+     "status": "unsupported", "nongreedy": None, "shared": None, "tree": "none", "tree_note": "no Recall",
      "note": "these engines reject --recall (native_host / qwen4_exp refuse it before start)"},
     {"base": "cuteafd", "head": "DeepSeek V4.1 native serve", "adapter": "patch v2", "status": "patch",
-     "nongreedy": False, "shared": False,
+     "nongreedy": False, "shared": False, "tree": "none", "tree_note": "greedy chain patch, unchanged",
      "note": "yee patch apply cuteafd --src DIR --variant v2 (v1 kept); greedy only; record in process memory"},
     {"base": "mlx-serve", "head": "DSpark (M5 xypd)", "adapter": "source-drop", "status": "patch",
-     "nongreedy": True, "shared": True,
+     "nongreedy": True, "shared": True, "tree": "native",
+     "tree_note": "r598: recalled copies and the stage draft verified as branch states of one batched verify "
+                  "(dspark.zig dsparkTreeStep); not in the source drop yet (r597 files), the build lives on M5",
      "note": "yee patch apply mlx-serve --src DIR replaces 4 files in src/engines/mlx/spec, rebuild; "
              "greedy and sampled requests; penalty requests do not speculate"},
+    {"base": "strata", "head": "MTP + prompt lookup (strata 0.1.59)", "adapter": "patch strata-recall",
+     "status": "patch", "nongreedy": True, "shared": True, "tree": "none",
+     "tree_note": "a recall copy replaces one window's chain drafts; no branches",
+     "note": "yee patch apply strata-recall --src DIR, rebuild the CUDA strata target, then RECALL_ACCEL=1 (or "
+             "--recall); solo windows and the serial --batch-mtp slots; not STRATA_BATCH_DF2 / STRATA_PIPED_MTP"},
 )
 
 
@@ -407,8 +416,10 @@ def bases_rows() -> list:
     rows = []
     for engine in ("sglang", "vllm"):
         for alg, (adapter, status, note) in registry.ADAPTERS[engine].items():
+            mode, why = registry.tree_mode(engine, alg)
             rows.append({"base": engine, "head": alg, "adapter": adapter, "status": status,
-                         "nongreedy": adapter is not None, "shared": adapter is not None, "note": note})
+                         "nongreedy": adapter is not None, "shared": adapter is not None, "note": note,
+                         "tree": mode if adapter is not None else "none", "tree_note": why})
     rows.extend(dict(r) for r in STATIC_BASES)
     return rows
 
@@ -418,10 +429,26 @@ def cmd_bases(args) -> int:
     if args.json:
         print(json.dumps(rows, indent=1, ensure_ascii=False), flush=True)
         return 0
-    print("%-10s %-22s %-14s %-11s %s" % ("base", "head", "adapter", "status", "note"), flush=True)
+    print("%-10s %-22s %-14s %-11s %-7s %s" % ("base", "head", "adapter", "status", "tree", "note"), flush=True)
     for r in rows:
-        print("%-10s %-22s %-14s %-11s %s" % (r["base"], r["head"], r["adapter"] or "-", r["status"], r["note"]),
-              flush=True)
+        print("%-10s %-22s %-14s %-11s %-7s %s" % (r["base"], r["head"], r["adapter"] or "-", r["status"],
+                                                   r.get("tree", "none"), r["note"]), flush=True)
+    return 0
+
+
+def cmd_config(args) -> int:
+    """4.2: what each switch resolves to in this environment, after the startup defaults."""
+    from .integrations import defaults
+
+    rows = defaults.effective()
+    if args.json:
+        print(json.dumps([{"name": n, "value": v, "source": s} for n, v, s in rows], indent=1), flush=True)
+        return 0
+    w = max(len(n) for n, _, _ in rows)
+    print("yee %s  (source: env = set in the environment, default = 4.2 default, off = YEE=0)" % __version__,
+          flush=True)
+    for n, v, s in rows:
+        print("%-*s  %-10s %s" % (w, n, v, s), flush=True)
     return 0
 
 
@@ -473,6 +500,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("bases", help="base x speculative head support table")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(fn=cmd_bases)
+    sp = sub.add_parser("config", help="effective value and source of every switch (4.2 defaults)")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(fn=cmd_config)
     return ap
 
 

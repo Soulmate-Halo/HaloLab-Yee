@@ -38,6 +38,7 @@ import time
 import numpy as np
 
 from ..core import ENV_NEW, ENV_OLD, _env
+from .. import tree as _tree
 
 LAG_STEPS = 3  # CPU snapshots may trail the step being launched by up to this many steps
 MAX_BS = 512
@@ -114,7 +115,7 @@ def build_plan(engine, rids, gamma: int, paused: bool = False, hist=None):
             entries.append((0, 0, None, 0))
             continue
         L = int(h[0])
-        prop = engine.propose(rid, n=Wn - 1)
+        prop = _tree.propose(engine, rid, n=Wn - 1)
         if prop is None:
             entries.append((0, L, None, 0))
             continue

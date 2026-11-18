@@ -1,0 +1,2728 @@
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 7a6a2827b..5b39d73e5 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -111,6 +111,8 @@ add_library(${TARGET}
+     speculative.h
+     kad.cpp
+     kad.h
++    recall.cpp
++    recall.h
+     subproc.cpp
+     subproc.h
+     trie.cpp
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 1c38a2519..8198a2a8c 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4155,6 +4155,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.speculative.kad_policy = value;
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KAD_POLICY"));
++    add_opt(common_arg(
++        {"--recall"},
++        "Yee recall: cross-request copy drafts from a token record, with or without a draft model (default: disabled)",
++        [](common_params & params) {
++            params.speculative.recall = true;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RECALL"));
++    add_opt(common_arg(
++        {"--recall-dir"}, "DIR",
++        "Yee recall record directory, kept across restarts (default: $RECALL_ACCEL_DIR, else memory only)",
++        [](common_params & params, const std::string & value) {
++            params.speculative.recall_dir = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RECALL_DIR"));
++    add_opt(common_arg(
++        {"--recall-read-only"},
++        "Yee recall: use an existing record without writing to it (default: disabled)",
++        [](common_params & params) {
++            params.speculative.recall_read_only = true;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RECALL_READ_ONLY"));
++    add_opt(common_arg(
++        {"--recall-gib"}, "F",
++        "Yee recall record capacity in GiB (default: $RECALL_ACCEL_GIB, else 0.0625)",
++        [](common_params & params, const std::string & value) {
++            params.speculative.recall_gib = std::stod(value);
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RECALL_GIB"));
++    add_opt(common_arg(
++        {"--recall-n"}, "N",
++        string_format("Yee recall: longest recall draft per step (default: %d)", params.speculative.recall_n),
++        [](common_params & params, int value) {
++            params.speculative.recall_n = std::max(1, std::min(value, 64));
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RECALL_N"));
+     add_opt(common_arg(
+         {"--spec-draft-n-min"}, "N",
+         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
+diff --git a/common/common.h b/common/common.h
+index f70e0c5a6..64fef33c2 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -396,6 +396,13 @@ struct common_params_speculative {
+     bool        kad        = false;
+     std::string kad_policy = ""; // policy JSON, hot reloaded (empty: $YEE_KAD_POLICY or ~/.cache/yee/kad/kad_policy.json)
+ 
++    // Yee recall (llama-server): cross-request copy drafts, with or without a draft model, see common/recall.h
++    bool        recall           = false;
++    std::string recall_dir       = "";    // record directory, kept across restarts (empty: $RECALL_ACCEL_DIR, else memory only)
++    bool        recall_read_only = false; // use the record without writing to it
++    double      recall_gib       = -1.0;  // record capacity in GiB (< 0: $RECALL_ACCEL_GIB, else 0.0625)
++    int32_t     recall_n         = 12;    // longest recall draft per step
++
+     bool has_dft() const {
+         return !draft.mparams.empty();
+     }
+diff --git a/common/kad.cpp b/common/kad.cpp
+index bd1357f71..597943861 100644
+--- a/common/kad.cpp
++++ b/common/kad.cpp
+@@ -395,6 +395,20 @@ void common_kad::release(int slot) {
+     st_.erase(slot);
+ }
+ 
++void common_kad::mark_hot(int slot) {
++    std::lock_guard<std::mutex> lock(mtx_);
++    if (policy_.mode != "ladder") {
++        return; // off / fixed ignore the hot window
++    }
++    auto it = st_.find(slot);
++    if (it == st_.end()) {
++        common_kad_state s;
++        s.cur = policy_.base;
++        it = st_.emplace(slot, s).first;
++    }
++    it->second.hot_until = step_ + policy_.hot_ttl;
++}
++
+ std::string common_kad::snapshot_locked() const {
+     json w = json::object();
+     for (const auto & kv : w_hist_) {
+diff --git a/common/kad.h b/common/kad.h
+index e8c1a9398..3b2576706 100644
+--- a/common/kad.h
++++ b/common/kad.h
+@@ -62,6 +62,7 @@ public:
+     int  width(int slot, int n_cap, bool structured); // draft count of this step for one slot
+     void observe(int slot, int v, int a);             // v drafts verified, a accepted (bonus token excluded)
+     void release(int slot);                           // the slot starts or ends a request
++    void mark_hot(int slot);                          // a recall proposal: width hot_k for hot_ttl steps (yee.kad mark_hot)
+ 
+     std::string snapshot_json();
+     const std::string & policy_file() const { return policy_file_; }
+diff --git a/common/recall.cpp b/common/recall.cpp
+new file mode 100644
+index 000000000..9a4b3ba33
+--- /dev/null
++++ b/common/recall.cpp
+@@ -0,0 +1,2154 @@
++// Yee Recall for llama-server: C++ port of yee.core RecallRecord (memory / disk backend, fifo eviction)
++// and RecallEngine (streams, own-context and record candidates, expectations, probes, feedback).
++// Rules, constants and tie-breaks follow yee/core.py line by line; see NOTES_core.md for the mapping.
++
++#include "recall.h"
++
++#include "kad.h"
++#include "log.h"
++
++#include <nlohmann/json.hpp>
++
++#include <algorithm>
++#include <atomic>
++#include <cctype>
++#include <chrono>
++#include <cmath>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <deque>
++#include <filesystem>
++#include <fstream>
++#include <map>
++#include <mutex>
++#include <sstream>
++#include <stdexcept>
++#include <thread>
++#include <unordered_map>
++#include <utility>
++
++#if !defined(_WIN32)
++#include <fcntl.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
++using json = nlohmann::json;
++namespace fs = std::filesystem;
++
++namespace {
++
++// ------------------------------------------------------------------------------------------------ constants (core.py:56-90)
++constexpr int64_t  REC_CHUNK_IDS  = 1 << 20;
++constexpr int64_t  REC_SENTINEL   = -1;
++constexpr int      REC_WINDOW     = 16;
++constexpr int      REC_DEDUP_RUN  = 128;
++constexpr int      REC_OVERLAP    = 32;
++constexpr int      REC_MAX_BACK   = 128;
++constexpr int      REC_MIN_TAIL   = 4;
++constexpr int      REC_SHORT_TIER = 3;
++constexpr double   REC_DEFAULT_INDEX_DENSITY = 0.25;
++constexpr double   REC_MIN_INDEX_DENSITY     = 1.0 / 64.0;
++constexpr double   REC_MAX_INDEX_DENSITY     = 4.0;
++constexpr uint64_t REC_P  = 0x9E3779B97F4A7C15ULL;
++constexpr uint64_t REC_M1 = 0xBF58476D1CE4E5B9ULL;
++
++const char * const REC_TIER_NAMES[4] = { "16-31", "32-63", "64+", "<16" };
++const char * const REC_SRC_NAMES[2]  = { "own", "record" };
++
++uint64_t rec_pow_p(int e) {
++    uint64_t r = 1;
++    for (int i = 0; i < e; ++i) {
++        r *= REC_P;
++    }
++    return r;
++}
++
++// polynomial window hash, uint64 wrap-around == python "& MASK64" (core.py:195-199)
++inline uint64_t rec_hash(const int64_t * t, int w) {
++    uint64_t h = 0;
++    for (int i = 0; i < w; ++i) {
++        h = h * REC_P + (uint64_t) (t[i] + 1);
++    }
++    return h;
++}
++
++// rolling update of a window hash of width w (pw1 = P^(w-1)); WINDOW: core.py:202-203 _roll_int
++inline uint64_t rec_roll(uint64_t h, int64_t out, int64_t in, uint64_t pw1) {
++    return (h - (uint64_t) (out + 1) * pw1) * REC_P + (uint64_t) (in + 1);
++}
++
++inline uint64_t rec_mix(uint64_t h) {
++    h ^= h >> 31;
++    h *= REC_M1;
++    h ^= h >> 27;
++    return h;
++}
++
++inline int rec_tier_of(int L) {
++    if (L < REC_WINDOW) {
++        return REC_SHORT_TIER;
++    }
++    if (L >= 64) {
++        return 2;
++    }
++    if (L >= 32) {
++        return 1;
++    }
++    return 0;
++}
++
++double rec_now() {
++    using namespace std::chrono;
++    return duration<double>(steady_clock::now().time_since_epoch()).count();
++}
++
++std::string rec_utc_stamp() {
++    const std::time_t t = std::time(nullptr);
++    std::tm tm{};
++#if defined(_WIN32)
++    gmtime_s(&tm, &t);
++#else
++    gmtime_r(&t, &tm);
++#endif
++    char buf[32];
++    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
++    return buf;
++}
++
++// ------------------------------------------------------------------------------------------------ environment (core.py:93-184)
++std::string rec_trim(std::string s) {
++    s.erase(0, s.find_first_not_of(" \t\r\n"));
++    s.erase(s.find_last_not_of(" \t\r\n") + 1);
++    return s;
++}
++
++std::string rec_lower(std::string s) {
++    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::tolower(c); });
++    return s;
++}
++
++bool rec_true(const std::string & v) {
++    const std::string s = rec_lower(rec_trim(v));
++    return s == "1" || s == "true" || s == "yes" || s == "on";
++}
++
++std::string rec_getenv(const std::string & name) {
++    if (name.empty()) {
++        return "";
++    }
++    const char * v = std::getenv(name.c_str());
++    return v ? rec_trim(v) : std::string();
++}
++
++struct rec_env_names {
++    const char * key;
++    const char * now;    // ENV_NEW
++    const char * old;    // ENV_OLD
++    const char * older;  // ENV_OLDER
++};
++
++const rec_env_names REC_ENV[] = {
++    { "on",            "RECALL_ACCEL",               "SGLANG_D_RECALL",               "DSV41_RECALL"              },
++    { "dir",           "RECALL_ACCEL_DIR",           "SGLANG_D_RECALL_DIR",           "DSV41_RECALL_DIR"          },
++    { "gib",           "RECALL_ACCEL_GIB",           "SGLANG_D_RECALL_GIB",           "DSV41_RECALL_GIB"          },
++    { "backend",       "RECALL_ACCEL_BACKEND",       "SGLANG_D_RECALL_BACKEND",       "RECALL_BACKEND"            },
++    { "min_match",     "RECALL_ACCEL_MIN_MATCH",     "SGLANG_D_RECALL_MIN_MATCH",     "DSV41_RECALL_MIN_MATCH"    },
++    { "prior",         "RECALL_ACCEL_PRIOR",         "SGLANG_D_RECALL_PRIOR",         "DSV41_RECALL_PRIOR"        },
++    { "read_only",     "RECALL_ACCEL_READ_ONLY",     "SGLANG_D_RECALL_READ_ONLY",     "DSV41_RECALL_READ_ONLY"    },
++    { "min_free_gib",  "RECALL_ACCEL_MIN_FREE_GIB",  "SGLANG_D_RECALL_MIN_FREE_GIB",  "DSV41_RECALL_MIN_FREE_GIB" },
++    { "evict",         "RECALL_ACCEL_EVICT",         "SGLANG_D_RECALL_EVICT",         "RECALL_EVICT"              },
++    { "dedup_run",     "RECALL_ACCEL_DEDUP_RUN",     "SGLANG_D_RECALL_DEDUP_RUN",     "RECALL_DEDUP_RUN"          },
++    { "index_density", "RECALL_ACCEL_INDEX_DENSITY", "SGLANG_D_RECALL_INDEX_DENSITY", "RECALL_INDEX_DENSITY"      },
++};
++
++// yee.core _env after yee's alias (YEE_<X> -> RECALL_ACCEL_<X> when unset): RECALL_ACCEL_<X> -> YEE_<X> -> old name ->
++// VLLM_D_RECALL_* -> older name; blank values count as unset
++std::string rec_env(const char * key, const std::string & def) {
++    for (const auto & e : REC_ENV) {
++        if (std::strcmp(e.key, key) != 0) {
++            continue;
++        }
++        std::string vllm = e.now;
++        vllm.replace(0, std::strlen("RECALL_ACCEL"), "VLLM_D_RECALL");
++        const std::string yee = "YEE" + std::string(e.now).substr(std::strlen("RECALL_ACCEL"));
++        for (const std::string & n : { std::string(e.now), yee, std::string(e.old), vllm, std::string(e.older) }) {
++            const std::string v = rec_getenv(n);
++            if (!v.empty()) {
++                return v;
++            }
++        }
++        return def;
++    }
++    return def;
++}
++
++double rec_env_double(const char * key, double def) {
++    const std::string v = rec_env(key, "");
++    if (v.empty()) {
++        return def;
++    }
++    try {
++        return std::stod(v);
++    } catch (...) {
++        return def;
++    }
++}
++
++// yee.tree env_value: YEE_ -> RECALL_ACCEL_ -> SGLANG_D_RECALL_ -> VLLM_D_RECALL_
++std::string rec_tree_env(const char * suffix, const std::string & def) {
++    for (const char * pre : { "YEE_", "RECALL_ACCEL_", "SGLANG_D_RECALL_", "VLLM_D_RECALL_" }) {
++        const std::string v = rec_getenv(std::string(pre) + suffix);
++        if (!v.empty()) {
++            return v;
++        }
++    }
++    return def;
++}
++
++// SHORT_WINDOWS (core.py:239-253): RECALL_ACCEL_WINDOWS, default "16,8,4" -> (8, 4), descending
++std::vector<int> rec_short_windows() {
++    const char * raw = std::getenv("RECALL_ACCEL_WINDOWS");
++    const std::string s = raw ? std::string(raw) : std::string("16,8,4");
++    std::vector<int> out;
++    std::stringstream ss(s);
++    std::string x;
++    while (std::getline(ss, x, ',')) {
++        x = rec_trim(x);
++        if (x.empty() || x.size() > 4 || !std::all_of(x.begin(), x.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
++            continue;
++        }
++        const int w = std::stoi(x);
++        if (w >= 4 && w < REC_WINDOW && std::find(out.begin(), out.end(), w) == out.end()) {
++            out.push_back(w);
++        }
++    }
++    std::sort(out.begin(), out.end(), std::greater<int>());
++    return out;
++}
++
++std::string rec_home() {
++    std::string h = rec_getenv("HOME");
++    if (h.empty()) {
++        h = rec_getenv("USERPROFILE");
++    }
++    return h.empty() ? std::string(".") : h;
++}
++
++std::string rec_expand(const std::string & p) {
++    if (p.size() >= 2 && p[0] == '~' && (p[1] == '/' || p[1] == '\\')) {
++        return rec_home() + p.substr(1);
++    }
++    if (p == "~") {
++        return rec_home();
++    }
++    return p;
++}
++
++struct rec_identity_error : std::runtime_error {
++    explicit rec_identity_error(const std::string & m) : std::runtime_error(m) {}
++};
++
++bool rec_write_private(const std::string & path, const std::string & text) {
++#if !defined(_WIN32)
++    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
++    if (fd < 0) {
++        return false;
++    }
++    const ssize_t n = ::write(fd, text.data(), text.size());
++    ::close(fd);
++    return n == (ssize_t) text.size();
++#else
++    std::ofstream f(path, std::ios::binary | std::ios::trunc);
++    f << text;
++    return f.good();
++#endif
++}
++
++bool rec_is_chunk_name(const std::string & name, int64_t & seq) {
++    // ^chunk-(\d{8})\.ids$
++    if (name.size() != 18 || name.compare(0, 6, "chunk-") != 0 || name.compare(14, 4, ".ids") != 0) {
++        return false;
++    }
++    int64_t v = 0;
++    for (int i = 6; i < 14; ++i) {
++        if (!std::isdigit((unsigned char) name[i])) {
++            return false;
++        }
++        v = v * 10 + (name[i] - '0');
++    }
++    seq = v;
++    return true;
++}
++
++// ------------------------------------------------------------------------------------------------ store (core.py:301-712)
++// One class for the memory and the disk backend: the disk backend keeps the same chunks in memory and appends every
++// write to chunk-%08d.ids (int32, little endian), like _DiskStore.
++struct rec_store {
++    int64_t C        = REC_CHUNK_IDS;
++    int64_t cap_ids  = REC_CHUNK_IDS;
++    int64_t base_pos = 0;
++    int64_t end_pos  = 0;
++    std::map<int64_t, std::vector<int32_t>> chunks;
++    std::map<int64_t, int64_t>              fill;
++    std::vector<std::pair<int64_t, int64_t>> ranges;
++
++    bool        disk      = false;
++    bool        read_only = false;
++    bool        writer    = true;
++    std::string dir;
++    json        identity_on_disk = json::object();
++    int64_t     load_evicted = 0;
++    std::string last_error;
++
++    FILE *  fh      = nullptr;
++    int64_t fh_seq  = -1;
++    int     lock_fd = -1;
++
++    ~rec_store() { close(); }
++
++    std::string chunk_path(int64_t seq) const {
++        char b[40];
++        std::snprintf(b, sizeof(b), "chunk-%08lld.ids", (long long) seq);
++        return dir + "/" + b;
++    }
++
++    // [g0, g1) as int64; false = out of range / evicted (python: None)
++    bool read(int64_t g0, int64_t g1, std::vector<int64_t> & out) const {
++        out.clear();
++        if (g0 < base_pos || g1 > end_pos || g0 > g1) {
++            return false;
++        }
++        out.resize((size_t) (g1 - g0));
++        int64_t pos = g0;
++        size_t  w   = 0;
++        while (pos < g1) {
++            const int64_t seq = pos / C;
++            const int64_t o   = pos - seq * C;
++            auto it = chunks.find(seq);
++            if (it == chunks.end()) {
++                out.clear();
++                return false;
++            }
++            const int64_t take = std::min(C - o, g1 - pos);
++            const int32_t * src = it->second.data() + o;
++            for (int64_t i = 0; i < take; ++i) {
++                out[w + (size_t) i] = src[i];
++            }
++            pos += take;
++            w += (size_t) take;
++        }
++        return true;
++    }
++
++    void open_file(int64_t seq) {
++        if (fh != nullptr) {
++            std::fclose(fh);
++            fh = nullptr;
++        }
++        fh_seq = -1;
++        const std::string path = chunk_path(seq);
++#if !defined(_WIN32)
++        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
++        if (fd >= 0) {
++            fh = ::fdopen(fd, "ab");
++            if (fh == nullptr) {
++                ::close(fd);
++            }
++        }
++#else
++        fh = std::fopen(path.c_str(), "ab");
++#endif
++        if (fh == nullptr) {
++            throw std::runtime_error("cannot open " + path);
++        }
++        fh_seq = seq;
++    }
++
++    void write(const int64_t * a, size_t n) {
++        size_t off = 0;
++        while (off < n) {
++            const int64_t seq = end_pos / C;
++            const int64_t o   = end_pos - seq * C;
++            auto & buf = chunks[seq];
++            if (buf.empty()) {
++                buf.assign((size_t) C, (int32_t) REC_SENTINEL);
++                fill[seq] = 0;
++            }
++            if (disk && (fh == nullptr || fh_seq != seq)) {
++                open_file(seq);
++            }
++            const int64_t take = std::min<int64_t>(C - o, (int64_t) (n - off));
++            for (int64_t i = 0; i < take; ++i) {
++                buf[(size_t) (o + i)] = (int32_t) a[off + (size_t) i];
++            }
++            if (disk) {
++                // int32 little endian (x86 / arm hosts), the layout of yee.core _DiskStore
++                if (std::fwrite(buf.data() + o, sizeof(int32_t), (size_t) take, fh) != (size_t) take) {
++                    throw std::runtime_error("write failed: " + chunk_path(seq));
++                }
++            }
++            fill[seq] = o + take;
++            end_pos += take;
++            off += (size_t) take;
++        }
++    }
++
++    void flush() {
++        if (fh != nullptr) {
++            std::fflush(fh);
++        }
++    }
++
++    void drop_range(int64_t seq) {
++        ranges.erase(std::remove_if(ranges.begin(), ranges.end(), [&](const std::pair<int64_t, int64_t> & r) { return r.first / C == seq; }),
++                     ranges.end());
++    }
++
++    int64_t evict() {
++        int64_t evicted = 0;
++        while (end_pos - base_pos > cap_ids && chunks.size() > 1) {
++            const int64_t oldest = chunks.begin()->first;
++            base_pos = (oldest + 1) * C;
++            chunks.erase(oldest);
++            fill.erase(oldest);
++            drop_range(oldest);
++            if (disk) {
++                if (fh != nullptr && fh_seq == oldest) {
++                    std::fclose(fh);
++                    fh     = nullptr;
++                    fh_seq = -1;
++                }
++                std::error_code ec;
++                fs::remove(chunk_path(oldest), ec);
++                if (ec) {
++                    last_error = "evict " + chunk_path(oldest) + ": " + ec.message();
++                }
++            }
++            evicted += 1;
++        }
++        return evicted;
++    }
++
++    // returns the files that could not be deleted
++    std::vector<std::string> clear() {
++        if (fh != nullptr) {
++            std::fclose(fh);
++            fh = nullptr;
++        }
++        fh_seq   = -1;
++        base_pos = 0;
++        end_pos  = 0;
++        chunks.clear();
++        fill.clear();
++        ranges.clear();
++        std::vector<std::string> failed;
++        if (disk && !dir.empty()) {
++            std::error_code ec;
++            for (const auto & de : fs::directory_iterator(dir, ec)) {
++                int64_t seq = 0;
++                const std::string name = de.path().filename().string();
++                if (rec_is_chunk_name(name, seq)) {
++                    std::error_code ec2;
++                    fs::remove(de.path(), ec2);
++                    if (ec2) {
++                        failed.push_back(de.path().string());
++                    }
++                }
++            }
++        }
++        return failed;
++    }
++
++    void close() {
++        if (fh != nullptr) {
++            std::fclose(fh);
++            fh = nullptr;
++        }
++        fh_seq = -1;
++#if !defined(_WIN32)
++        if (lock_fd >= 0) {
++            ::flock(lock_fd, LOCK_UN);
++            ::close(lock_fd);
++            lock_fd = -1;
++        }
++#endif
++        if (disk) {
++            writer = false;
++        }
++    }
++
++    int64_t disk_bytes() const {
++        if (!disk || dir.empty()) {
++            return 0;
++        }
++        int64_t total = 0;
++        std::error_code ec;
++        for (const auto & de : fs::directory_iterator(dir, ec)) {
++            int64_t seq = 0;
++            if (rec_is_chunk_name(de.path().filename().string(), seq)) {
++                std::error_code ec2;
++                const auto sz = fs::file_size(de.path(), ec2);
++                if (!ec2) {
++                    total += (int64_t) sz;
++                }
++            }
++        }
++        return total;
++    }
++
++    int64_t mem_bytes() const { return (int64_t) chunks.size() * C * 4; }
++
++    // _DiskStore._open_dir (core.py:385-433); identity: {"tokenizer_digest", "vocab_size", "model", "created"}
++    void open_dir(const json & identity) {
++        writer = false;
++        std::error_code ec;
++        if (!fs::is_directory(dir, ec)) {
++            if (read_only) {
++                return;
++            }
++            fs::create_directories(dir, ec);
++            if (ec) {
++                throw std::runtime_error("cannot create " + dir + ": " + ec.message());
++            }
++        }
++        fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
++        const std::string ident_path = dir + "/identity";
++        if (fs::exists(ident_path, ec)) {
++            json old = json::object();
++            try {
++                std::ifstream f(ident_path, std::ios::binary);
++                std::stringstream ss;
++                ss << f.rdbuf();
++                old = json::parse(ss.str());
++                if (!old.is_object()) {
++                    old = json::object();
++                }
++            } catch (...) {
++                old = json::object();
++            }
++            auto str_of = [](const json & j, const char * k) -> std::string {
++                if (!j.contains(k) || j[k].is_null()) {
++                    return "";
++                }
++                return j[k].is_string() ? j[k].get<std::string>() : j[k].dump();
++            };
++            const std::string od = str_of(old, "tokenizer_digest");
++            const std::string nd = str_of(identity, "tokenizer_digest");
++            const bool ov_set = old.contains("vocab_size") && old["vocab_size"].is_number_integer();
++            const bool nv_set = identity.contains("vocab_size") && identity["vocab_size"].is_number_integer();
++            const bool vocab_differs = ov_set && nv_set && old["vocab_size"].get<int64_t>() != identity["vocab_size"].get<int64_t>();
++            if ((!od.empty() && !nd.empty() && od != nd) || vocab_differs) {
++                throw rec_identity_error("recall record " + dir + " was written by tokenizer " + od.substr(0, 16) + " (vocab " +
++                                         (ov_set ? old["vocab_size"].dump() : std::string("None")) + ", model " + str_of(old, "model") +
++                                         "); this server's tokenizer is " + nd.substr(0, 16) + " (vocab " +
++                                         (nv_set ? identity["vocab_size"].dump() : std::string("None")) + ")");
++            }
++            identity_on_disk = old;
++        } else if (!read_only) {
++            json data = identity;
++            if (!data.contains("created")) {
++                data["created"] = rec_utc_stamp();
++            }
++            rec_write_private(ident_path, data.dump() + "\n");
++            identity_on_disk = data;
++        }
++        if (read_only) {
++            return;
++        }
++#if !defined(_WIN32)
++        const std::string lock_path = dir + "/lock";
++        const int fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT, 0600);
++        if (fd < 0) {
++            return;
++        }
++        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
++            ::close(fd);
++            return; // another writer holds the record: read-only here
++        }
++        lock_fd = fd;
++#endif
++        writer = true;
++    }
++
++    // _DiskStore._load (core.py:435-474)
++    void load() {
++        std::error_code ec;
++        if (!fs::is_directory(dir, ec)) {
++            return;
++        }
++        std::vector<int64_t> seqs;
++        for (const auto & de : fs::directory_iterator(dir, ec)) {
++            int64_t seq = 0;
++            if (rec_is_chunk_name(de.path().filename().string(), seq)) {
++                seqs.push_back(seq);
++            }
++        }
++        if (seqs.empty()) {
++            return;
++        }
++        std::sort(seqs.begin(), seqs.end());
++        std::vector<int64_t> run = { seqs.back() };
++        for (size_t i = seqs.size() - 1; i-- > 0;) {
++            if (seqs[i] != run.front() - 1) {
++                break;
++            }
++            run.insert(run.begin(), seqs[i]);
++        }
++        if (writer) {
++            for (int64_t s : seqs) {
++                if (s < run.front()) {
++                    std::error_code ec2;
++                    fs::remove(chunk_path(s), ec2);
++                }
++            }
++        }
++        for (int64_t s : run) {
++            const std::string path = chunk_path(s);
++            std::ifstream f(path, std::ios::binary);
++            std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++            const size_t usable = data.size() / 4 * 4;
++            if (usable != data.size() && writer) {
++                std::error_code ec2;
++                fs::resize_file(path, usable, ec2);
++            }
++            const size_t n = std::min<size_t>(usable / 4, (size_t) C);
++            std::vector<int32_t> buf((size_t) C, (int32_t) REC_SENTINEL);
++            std::memcpy(buf.data(), data.data(), n * 4);
++            chunks[s] = std::move(buf);
++            fill[s]   = (int64_t) n;
++        }
++        const int64_t last = run.back();
++        base_pos = run.front() * C;
++        end_pos  = last * C + fill[last];
++        if (writer) {
++            load_evicted = evict();
++        }
++        for (const auto & kv : chunks) {
++            const int64_t g0 = kv.first * C;
++            ranges.emplace_back(g0, kv.first == last ? g0 + fill[kv.first] : g0 + C);
++        }
++    }
++};
++
++// _segments (core.py:280-292): True runs of keep, widened by overlap on both sides, [lo, hi)
++std::vector<std::pair<int64_t, int64_t>> rec_segments(const std::vector<char> & keep, int64_t overlap) {
++    std::vector<std::pair<int64_t, int64_t>> out;
++    const int64_t n = (int64_t) keep.size();
++    if (n == 0) {
++        return out;
++    }
++    if (std::all_of(keep.begin(), keep.end(), [](char v) { return v != 0; })) {
++        out.emplace_back(0, n);
++        return out;
++    }
++    int64_t i = 0;
++    while (i < n) {
++        if (keep[(size_t) i]) {
++            const int64_t s = i;
++            while (i < n && keep[(size_t) i]) {
++                ++i;
++            }
++            out.emplace_back(std::max<int64_t>(0, s - overlap), std::min<int64_t>(n, i + overlap));
++        } else {
++            ++i;
++        }
++    }
++    return out;
++}
++
++// ------------------------------------------------------------------------------------------------ record (core.py:827-1693)
++// fifo eviction only (heat / hot zone / cold ring / cuda / snapshots are not ported, see NOTES_core.md)
++struct rec_record {
++    std::string backend = "memory";  // "memory" | "disk"
++    std::string dir;                 // disk directory, or the control directory of a memory record ("" = none)
++    bool        read_only   = false;
++    bool        writer      = true;
++    bool        add_blocked = false;
++    int64_t     chunk_ids   = REC_CHUNK_IDS;
++    double      gib         = 1.0 / 16;
++    int64_t     cap_ids     = 0;
++    int         dedup_run   = REC_DEDUP_RUN;
++    double      index_density  = REC_DEFAULT_INDEX_DENSITY;
++    double      min_free_bytes = 4.0 * (double) (1LL << 30);
++
++    int64_t slots = 0, mask = 0, sslots = 0, smask = 0;
++    std::vector<uint64_t> keys;
++    std::vector<int64_t>  pos;
++    struct short_tab {
++        int      w;
++        uint64_t pw1;
++        std::vector<uint64_t> k;
++        std::vector<int64_t>  p;
++    };
++    std::vector<short_tab> shorts;
++    uint64_t pw1_long = rec_pow_p(REC_WINDOW - 1);
++
++    rec_store store;
++
++    int64_t added_ids = 0, deduped_ids = 0, adds = 0, evicted_chunks = 0, skipped_low_disk = 0, short_hits = 0;
++    std::string last_error;
++    bool        clear_requested = false;
++    json        identity_on_disk = json::object();
++
++    rec_record(const std::string & backend_, const std::string & directory, const json & identity, double gib_, bool read_only_,
++               double min_free_gib, int64_t chunk_ids_) {
++        backend   = backend_;
++        chunk_ids = chunk_ids_;
++        if (chunk_ids < 4 * REC_WINDOW) {
++            throw std::invalid_argument("chunk_ids too small");
++        }
++        gib     = gib_;
++        cap_ids = std::max<int64_t>(chunk_ids, (int64_t) (gib * (double) (1LL << 30)) / 4);
++        dedup_run = std::max(2 * REC_WINDOW, (int) rec_env_double("dedup_run", REC_DEDUP_RUN));
++        index_density = std::min(REC_MAX_INDEX_DENSITY, std::max(REC_MIN_INDEX_DENSITY, rec_env_double("index_density", REC_DEFAULT_INDEX_DENSITY)));
++        min_free_bytes = min_free_gib * (double) (1LL << 30);
++        read_only = read_only_;
++
++        const int64_t want = std::max<int64_t>(2, (int64_t) ((double) cap_ids * index_density));
++        int bits = 0;
++        while ((1LL << bits) < want) {
++            ++bits; // (want - 1).bit_length()
++        }
++        slots  = 1LL << std::max(16, bits);
++        mask   = slots - 1;
++        keys.assign((size_t) slots, 0);
++        pos.assign((size_t) slots, -1);
++        sslots = std::max<int64_t>(1LL << 14, slots / 4);
++        smask  = sslots - 1;
++        for (int w : rec_short_windows()) {
++            shorts.push_back({ w, rec_pow_p(w - 1), std::vector<uint64_t>((size_t) sslots, 0), std::vector<int64_t>((size_t) sslots, -1) });
++        }
++
++        store.C       = chunk_ids;
++        store.cap_ids = std::max(chunk_ids, cap_ids);
++        if (backend == "disk") {
++            store.disk      = true;
++            store.read_only = read_only;
++            store.dir       = fs::absolute(fs::path(rec_expand(directory))).lexically_normal().string();
++            store.open_dir(identity);
++            store.load();
++            dir = store.dir;
++        } else if (!directory.empty()) {
++            // memory backend: the directory only holds control files (clear.request)
++            std::error_code ec;
++            dir = fs::absolute(fs::path(rec_expand(directory))).lexically_normal().string();
++            fs::create_directories(dir, ec);
++            if (ec) {
++                dir.clear();
++            }
++        }
++        writer           = store.writer;
++        identity_on_disk = store.identity_on_disk;
++        evicted_chunks  += store.load_evicted;
++        for (const auto & r : store.ranges) {
++            index_range(r.first, r.second);
++        }
++    }
++
++    int64_t base() const { return store.base_pos; }
++    int64_t end() const { return store.end_pos; }
++
++    std::string state() const {
++        if (add_blocked) {
++            return "blocked";
++        }
++        return writer ? "writing" : "read-only";
++    }
++
++    // ------------------------------------------------------------------ index (core.py:1193-1258)
++    void index_short(const std::vector<int64_t> & a, int64_t s0, int64_t g0, int64_t g1) {
++        for (auto & tab : shorts) {
++            const int     w   = tab.w;
++            const int64_t s0w = std::max(base(), g0 - (w - 1));
++            const int64_t off = s0w - s0;
++            if (off < 0 || off > (int64_t) a.size()) {
++                continue;
++            }
++            const int64_t asz  = (int64_t) a.size() - off;
++            const int64_t span = w + REC_MIN_TAIL;
++            const int64_t m    = std::min(asz - span + 1, g1 - w - s0w + 1);
++            if (m <= 0) {
++                continue;
++            }
++            const int64_t * aw = a.data() + off;
++            std::vector<int64_t> cs((size_t) asz + 1, 0);
++            for (int64_t i = 0; i < asz; ++i) {
++                cs[(size_t) i + 1] = cs[(size_t) i] + (aw[i] < 0 ? 1 : 0);
++            }
++            uint64_t h = rec_hash(aw, w);
++            for (int64_t j = 0; j < m; ++j) {
++                if (j > 0) {
++                    h = rec_roll(h, aw[j - 1], aw[j + w - 1], tab.pw1);
++                }
++                if (cs[(size_t) (j + span)] - cs[(size_t) j] != 0) {
++                    continue;
++                }
++                const size_t s = (size_t) (rec_mix(h) & (uint64_t) smask);
++                tab.k[s] = h;
++                tab.p[s] = s0w + j + w;
++            }
++        }
++    }
++
++    void index_range(int64_t g0, int64_t g1) {
++        const int64_t s0    = std::max(base(), g0 - (REC_WINDOW - 1));
++        const int64_t g_ext = std::min(end(), g1 + REC_MIN_TAIL);
++        if (g_ext - s0 < REC_WINDOW + REC_MIN_TAIL) {
++            return;
++        }
++        std::vector<int64_t> a;
++        if (!store.read(s0, g_ext, a)) {
++            return;
++        }
++        index_short(a, s0, g0, g1);
++        const int64_t span = REC_WINDOW + REC_MIN_TAIL;
++        const int64_t m    = std::min((int64_t) a.size() - span + 1, g1 - REC_WINDOW - s0 + 1);
++        if (m <= 0) {
++            return;
++        }
++        std::vector<int64_t> cs(a.size() + 1, 0);
++        for (size_t i = 0; i < a.size(); ++i) {
++            cs[i + 1] = cs[i] + (a[i] < 0 ? 1 : 0);
++        }
++        uint64_t h = rec_hash(a.data(), REC_WINDOW);
++        for (int64_t j = 0; j < m; ++j) {
++            if (j > 0) {
++                h = rec_roll(h, a[(size_t) j - 1], a[(size_t) (j + REC_WINDOW - 1)], pw1_long);
++            }
++            if (cs[(size_t) (j + span)] - cs[(size_t) j] != 0) {
++                continue;
++            }
++            const size_t s = (size_t) (rec_mix(h) & (uint64_t) mask);
++            keys[s] = h;
++            pos[s]  = s0 + j + REC_WINDOW;
++        }
++    }
++
++    void purge_index() {
++        for (auto & tab : shorts) {
++            const int64_t lim = base() + tab.w;
++            for (int64_t s = 0; s < sslots; ++s) {
++                if (tab.p[(size_t) s] < lim) {
++                    tab.p[(size_t) s] = -1;
++                    tab.k[(size_t) s] = 0;
++                }
++            }
++        }
++        const int64_t lim = base() + REC_WINDOW;
++        for (int64_t s = 0; s < slots; ++s) {
++            if (pos[(size_t) s] < lim) {
++                pos[(size_t) s]  = -1;
++                keys[(size_t) s] = 0;
++            }
++        }
++    }
++
++    void evict() {
++        const int64_t n = store.evict();
++        evicted_chunks += n;
++        if (n) {
++            purge_index();
++        }
++    }
++
++    // ------------------------------------------------------------------ dedup + append (core.py:1260-1360)
++    void extend_run(const std::vector<int64_t> & a, int64_t s, int64_t e, int64_t p_s, int64_t p_e, int64_t & ts_out, int64_t & te_out) {
++        int64_t       ts = s;
++        const int64_t rs = p_s - REC_WINDOW;
++        int64_t       k  = std::min<int64_t>({ 256, ts, rs - base() });
++        std::vector<int64_t> rec;
++        if (k > 0 && store.read(rs - k, rs, rec)) {
++            int64_t j = 0;
++            while (j < k && rec[(size_t) (k - 1 - j)] == a[(size_t) (ts - 1 - j)]) {
++                ++j;
++            }
++            ts -= j;
++        }
++        int64_t       te  = e + REC_WINDOW;
++        const int64_t re_ = p_e;
++        k = std::min<int64_t>({ 256, (int64_t) a.size() - te, end() - re_ });
++        if (k > 0 && store.read(re_, re_ + k, rec)) {
++            int64_t j = 0;
++            while (j < k && rec[(size_t) j] == a[(size_t) (te + j)]) {
++                ++j;
++            }
++            te += j;
++        }
++        ts_out = ts;
++        te_out = te;
++    }
++
++    std::vector<char> novel_mask(const std::vector<int64_t> & a) {
++        const int64_t na = (int64_t) a.size();
++        std::vector<char> keep((size_t) na, 1);
++        if (end() - base() < REC_WINDOW || na < REC_WINDOW) {
++            return keep;
++        }
++        const int64_t nw = na - REC_WINDOW + 1;
++        std::vector<int64_t> p((size_t) nw);
++        std::vector<char>    valid((size_t) nw, 0);
++        bool any = false;
++        uint64_t h = rec_hash(a.data(), REC_WINDOW);
++        for (int64_t i = 0; i < nw; ++i) {
++            if (i > 0) {
++                h = rec_roll(h, a[(size_t) i - 1], a[(size_t) (i + REC_WINDOW - 1)], pw1_long);
++            }
++            const size_t  s  = (size_t) (rec_mix(h) & (uint64_t) mask);
++            const int64_t pp = pos[s];
++            p[(size_t) i]     = pp;
++            valid[(size_t) i] = keys[s] == h && pp - REC_WINDOW >= base() && pp <= end();
++            any = any || valid[(size_t) i];
++        }
++        if (!any) {
++            return keep;
++        }
++        std::vector<char> chain((size_t) nw, 0);
++        for (int64_t i = 1; i < nw; ++i) {
++            chain[(size_t) i] = valid[(size_t) i] && valid[(size_t) i - 1] && p[(size_t) i] == p[(size_t) i - 1] + 1;
++        }
++        std::vector<int64_t> starts, ends;
++        for (int64_t i = 0; i < nw; ++i) {
++            const bool nxt = i + 1 < nw ? chain[(size_t) i + 1] != 0 : false;
++            if (valid[(size_t) i] && !chain[(size_t) i]) {
++                starts.push_back(i);
++            }
++            if (valid[(size_t) i] && !nxt) {
++                ends.push_back(i);
++            }
++        }
++        for (size_t q = 0; q < starts.size() && q < ends.size(); ++q) {
++            const int64_t s = starts[q], e = ends[q];
++            const int64_t cover = (e - s + 1) + (REC_WINDOW - 1);
++            const bool sel = na < 2 * REC_WINDOW ? cover >= REC_WINDOW : cover >= 2 * REC_WINDOW;
++            if (!sel) {
++                continue;
++            }
++            int64_t ts = 0, te = 0;
++            extend_run(a, s, e, p[(size_t) s], p[(size_t) e], ts, te);
++            if (te - ts >= dedup_run || (ts == 0 && te == na)) {
++                for (int64_t i = std::max<int64_t>(0, ts); i < std::min(te, na); ++i) {
++                    keep[(size_t) i] = 0;
++                }
++            }
++        }
++        return keep;
++    }
++
++    int64_t append_segment(const int64_t * seg, size_t n) {
++        if (end() > base()) {
++            std::vector<int64_t> last;
++            if (store.read(end() - 1, end(), last) && last[0] != REC_SENTINEL) {
++                const int64_t s = REC_SENTINEL;
++                store.write(&s, 1);
++            }
++        }
++        const int64_t start = end();
++        store.write(seg, n);
++        index_range(start, end());
++        return (int64_t) n;
++    }
++
++    int64_t add(const std::vector<int64_t> & ids) {
++        if (!writer || add_blocked) {
++            return 0;
++        }
++        std::vector<int64_t> a;
++        a.reserve(ids.size());
++        for (int64_t x : ids) {
++            if (x >= 0) {
++                a.push_back(x);
++            }
++        }
++        if ((int64_t) a.size() < REC_WINDOW) {
++            return 0;
++        }
++        if (backend == "disk" && !dir.empty()) {
++            std::error_code ec;
++            const fs::space_info sp = fs::space(dir, ec);
++            if (!ec && (double) sp.free < min_free_bytes) {
++                skipped_low_disk += 1;
++                return 0;
++            }
++        }
++        const std::vector<char> keep = novel_mask(a);
++        int64_t added = 0;
++        for (const auto & ij : rec_segments(keep, REC_OVERLAP)) {
++            if (ij.second - ij.first >= REC_WINDOW) {
++                added += append_segment(a.data() + ij.first, (size_t) (ij.second - ij.first));
++            }
++        }
++        const int64_t kept = (int64_t) std::count_if(keep.begin(), keep.end(), [](char v) { return v != 0; });
++        deduped_ids += (int64_t) a.size() - kept;
++        if (added) {
++            store.flush();
++            evict();
++        }
++        added_ids += added;
++        adds += 1;
++        return added;
++    }
++
++    // ------------------------------------------------------------------ lookup (core.py:1362-1506)
++    // back extension shared by the long and the short windows: L = w + equal ids before the window
++    int back_extend(const int64_t * t, int64_t n, int64_t p, int w, int max_back) {
++        int L = w;
++        const int64_t lim = std::min<int64_t>(max_back, n);
++        if (lim > w) {
++            const int64_t g0 = std::max(base(), p - lim);
++            std::vector<int64_t> back;
++            if (store.read(g0, p - w, back) && !back.empty()) {
++                const int64_t bs = (int64_t) back.size();
++                int64_t j = 0;
++                while (j < bs && back[(size_t) (bs - 1 - j)] == t[n - w - 1 - j]) {
++                    ++j;
++                }
++                L += (int) j;
++            }
++        }
++        return L;
++    }
++
++    bool window_matches(const int64_t * t, int64_t n, int64_t p, int w) {
++        std::vector<int64_t> rec;
++        if (!store.read(p - w, p, rec)) {
++            return false;
++        }
++        for (int i = 0; i < w; ++i) {
++            if (rec[(size_t) i] != t[n - w + i]) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    bool cold_lookup(const int64_t * t, int64_t n, int max_back, uint64_t h, int64_t & p_out, int & L_out) {
++        if (end() - base() < REC_WINDOW) {
++            return false;
++        }
++        const size_t s = (size_t) (rec_mix(h) & (uint64_t) mask);
++        if (keys[s] != h) {
++            return false;
++        }
++        const int64_t p = pos[s];
++        if (p - REC_WINDOW < base() || p > end()) {
++            return false;
++        }
++        if (!window_matches(t, n, p, REC_WINDOW)) {
++            return false;
++        }
++        p_out = p;
++        L_out = back_extend(t, n, p, REC_WINDOW, max_back);
++        return true;
++    }
++
++    bool short_hit(const short_tab & tab, const int64_t * t, int64_t n, int max_back, int64_t & p_out, int & L_out) {
++        const int w = tab.w;
++        if (n < w) {
++            return false;
++        }
++        const uint64_t hw = rec_hash(t + n - w, w);
++        const size_t   s  = (size_t) (rec_mix(hw) & (uint64_t) smask);
++        if (tab.k[s] != hw) {
++            return false;
++        }
++        const int64_t p = tab.p[s];
++        if (p - w < base() || p > end()) {
++            return false;
++        }
++        if (!window_matches(t, n, p, w)) {
++            return false;
++        }
++        p_out = p;
++        L_out = back_extend(t, n, p, w, max_back);
++        return true;
++    }
++
++    bool short_lookup(const int64_t * t, int64_t n, int max_back, int64_t & p_out, int & L_out) {
++        if (end() - base() < REC_WINDOW) {
++            return false;
++        }
++        for (const auto & tab : shorts) {
++            if (short_hit(tab, t, n, max_back, p_out, L_out)) {
++                short_hits += 1;
++                return true;
++            }
++        }
++        return false;
++    }
++
++    bool lookup(const int64_t * t, int64_t n, int max_back, const uint64_t * h, int64_t & p_out, int & L_out) {
++        bool hit = false;
++        if (n >= REC_WINDOW) {
++            const uint64_t hh = h ? *h : rec_hash(t + n - REC_WINDOW, REC_WINDOW);
++            hit = cold_lookup(t, n, max_back, hh, p_out, L_out);
++        }
++        if (!hit && !shorts.empty()) {
++            hit = short_lookup(t, n, max_back, p_out, L_out);
++        }
++        return hit;
++    }
++
++    // every distinct hit (long window, then each short window), sorted by match length, stable
++    void lookup_all(const int64_t * t, int64_t n, int max_back, const uint64_t * h, std::vector<std::pair<int64_t, int>> & out) {
++        out.clear();
++        auto add = [&](int64_t p, int L) {
++            for (const auto & o : out) {
++                if (o.first == p) {
++                    return;
++                }
++            }
++            out.emplace_back(p, L);
++        };
++        int64_t p = 0;
++        int     L = 0;
++        if (n >= REC_WINDOW) {
++            const uint64_t hh = h ? *h : rec_hash(t + n - REC_WINDOW, REC_WINDOW);
++            if (cold_lookup(t, n, max_back, hh, p, L)) {
++                add(p, L);
++            }
++        }
++        if (!shorts.empty() && end() - base() >= REC_WINDOW) {
++            for (const auto & tab : shorts) {
++                if (short_hit(tab, t, n, max_back, p, L)) {
++                    add(p, L);
++                }
++            }
++        }
++        std::stable_sort(out.begin(), out.end(), [](const std::pair<int64_t, int> & x, const std::pair<int64_t, int> & y) { return x.second > y.second; });
++    }
++
++    // at most n ids after pos (at least min_n), cut at a sentinel
++    bool continuation(int64_t p, int n, int min_n, std::vector<int64_t> & seg) {
++        const int64_t e = std::min<int64_t>(p + n, end());
++        if (e - p < min_n) {
++            return false;
++        }
++        if (!store.read(p, e, seg)) {
++            return false;
++        }
++        for (size_t i = 0; i < seg.size(); ++i) {
++            if (seg[i] < 0) {
++                seg.resize(i);
++                break;
++            }
++        }
++        return (int) seg.size() >= min_n;
++    }
++
++    // core.py:1508-1526; returns "" or an error text (python raises)
++    std::string clear() {
++        if (!writer) {
++            return "PermissionError: recall record " + (dir.empty() ? backend : dir) + " is read-only here";
++        }
++        const std::vector<std::string> failed = store.clear();
++        std::fill(keys.begin(), keys.end(), 0);
++        std::fill(pos.begin(), pos.end(), -1);
++        for (auto & tab : shorts) {
++            std::fill(tab.k.begin(), tab.k.end(), 0);
++            std::fill(tab.p.begin(), tab.p.end(), -1);
++        }
++        added_ids = deduped_ids = adds = evicted_chunks = 0;
++        skipped_low_disk = 0;
++        if (!failed.empty()) {
++            add_blocked = true;
++            std::string names;
++            for (const auto & f : failed) {
++                names += (names.empty() ? "" : ", ") + f;
++            }
++            last_error = "could not delete " + names;
++            return "OSError: " + last_error;
++        }
++        add_blocked = false;
++        last_error.clear();
++        return "";
++    }
++
++    bool poll_clear_request() {
++        bool req = clear_requested;
++        clear_requested = false;
++        if (!dir.empty()) {
++            const std::string ctl = dir + "/clear.request";
++            std::error_code ec;
++            if (fs::exists(ctl, ec)) {
++                fs::remove(ctl, ec);
++                req = true;
++            }
++        }
++        return req;
++    }
++
++    json stats() const {
++        int64_t short_bytes = 0;
++        for (const auto & tab : shorts) {
++            short_bytes += (int64_t) (tab.k.size() * 8 + tab.p.size() * 8);
++        }
++        return json{
++            { "dir", !dir.empty() ? dir : backend },
++            { "backend", backend },
++            { "state", state() },
++            { "writer", writer },
++            { "ids", end() - base() },
++            { "chunks", (int64_t) store.chunks.size() },
++            { "bytes_disk", store.disk_bytes() },
++            { "bytes_mem", store.mem_bytes() + (int64_t) (keys.size() * 8 + pos.size() * 8) + short_bytes },
++            { "bytes_gpu", 0 },
++            { "cap_ids", cap_ids },
++            { "added_ids", added_ids },
++            { "deduped_ids", deduped_ids },
++            { "adds", adds },
++            { "evicted_chunks", evicted_chunks },
++            { "skipped_low_disk", skipped_low_disk },
++            { "add_blocked", add_blocked },
++            { "last_error", !last_error.empty() ? last_error : store.last_error },
++            { "evict_mode", "fifo" },
++            { "dedup_run", dedup_run },
++            { "short_hits", short_hits },
++            { "index_density", index_density },
++            { "index_slots", slots },
++            { "short_windows", [&] { json a = json::array(); for (const auto & t : shorts) a.push_back(t.w); return a; }() },
++        };
++    }
++};
++
++// ------------------------------------------------------------------------------------------------ engine parts (core.py:1693-1756)
++struct rec_stat {
++    double  n      = 0.0;
++    double  s      = 0.0;
++    int64_t offers = 0;
++    int64_t landed = 0;
++};
++
++struct rec_pending {
++    int     src;
++    int     tier;
++    bool    probe;
++    int     real;
++    double  own;
++    int64_t pos;
++};
++
++struct rec_stream {
++    std::vector<int64_t> ctx;
++    uint64_t h    = 0;
++    std::unordered_map<uint64_t, int64_t> own;
++    int64_t prev     = -1;
++    int     cooldown = 0;
++    std::deque<rec_pending> pending;
++    double  own_ema = 0.0;
++    std::vector<int64_t> prompt_tail;
++    int64_t offers    = 0;
++    int64_t out_len   = 0;
++    double  last_seen = 0.0;
++
++    void append(const int64_t * toks, size_t m, uint64_t pw1) {
++        for (size_t i = 0; i < m; ++i) {
++            const int64_t t = toks[i];
++            ctx.push_back(t);
++            const size_t n = ctx.size();
++            if (n > (size_t) REC_WINDOW) {
++                h = rec_roll(h, ctx[n - REC_WINDOW - 1], t, pw1);
++            } else if (n == (size_t) REC_WINDOW) {
++                h = rec_hash(ctx.data(), REC_WINDOW);
++            } else {
++                continue;
++            }
++            auto it = own.find(h);
++            prev = it == own.end() ? -1 : it->second;
++            own[h] = (int64_t) n;
++        }
++    }
++};
++
++struct rec_cand {
++    int src  = 0; // 0 own, 1 record
++    int tier = 0;
++    int L    = 0;
++    std::vector<int64_t> toks;
++    int     real = 0;
++    int64_t pos  = -1;
++};
++
++struct rec_job {
++    int kind = 0; // 1 add, 2 clear, 3 stats
++    std::vector<int64_t> ids;
++    std::string text;
++};
++
++} // namespace
++
++// ------------------------------------------------------------------------------------------------ public helpers
++bool common_recall_env_enabled() {
++    return rec_true(rec_env("on", "0")) || rec_true(rec_getenv("YEE_RECALL"));
++}
++
++void common_recall_config_from_env(common_recall_config & cfg) {
++    if (cfg.dir.empty()) {
++        cfg.dir = rec_env("dir", "");
++        if (cfg.dir.empty() && rec_lower(rec_env("backend", "")) == "disk") {
++            // explicit disk backend without a directory: the yee.core default ~/.cache/recall_accel/<digest[:16]>
++            const std::string digest = cfg.identity.empty() ? std::string("unknown") : cfg.identity;
++            cfg.dir = rec_home() + "/.cache/recall_accel/" + digest.substr(0, 16);
++        }
++    }
++    if (cfg.gib < 0) {
++        cfg.gib = rec_env_double("gib", 0.0625);
++    }
++    if (cfg.read_only < 0) {
++        cfg.read_only = rec_true(rec_env("read_only", "0")) ? 1 : 0;
++    }
++    if (cfg.min_match < 0) {
++        cfg.min_match = (int) rec_env_double("min_match", REC_WINDOW);
++    }
++    if (cfg.stats_file.empty()) {
++        cfg.stats_file = rec_getenv("YEE_RECALL_STATS_FILE");
++    }
++    if (cfg.log_s < 0) {
++        const std::string v = rec_getenv("YEE_RECALL_LOG_S");
++        try {
++            cfg.log_s = v.empty() ? 30.0 : std::stod(v);
++        } catch (...) {
++            cfg.log_s = 30.0;
++        }
++    }
++}
++
++// identity of a list of token pieces (common_recall_vocab_identity); declared here for the unit test
++std::string common_recall_identity_of(int32_t n_vocab, const std::vector<std::string> & pieces) {
++    std::string buf = "yee-recall-vocab-v1\nn_vocab=" + std::to_string(n_vocab) + "\n";
++    for (const auto & p : pieces) {
++        buf += std::to_string(p.size());
++        buf += ':';
++        buf += p;
++        buf += '\n';
++    }
++    return common_kad_sha256_hex(buf);
++}
++
++std::string common_recall_vocab_identity(const struct llama_vocab * vocab) {
++    if (vocab == nullptr) {
++        return "";
++    }
++    const int32_t n = llama_vocab_n_tokens(vocab);
++    std::vector<std::string> pieces;
++    pieces.reserve((size_t) std::max(0, n));
++    for (int32_t i = 0; i < n; ++i) {
++        const char * t = llama_vocab_get_text(vocab, i);
++        pieces.emplace_back(t ? t : "");
++    }
++    return common_recall_identity_of(n, pieces);
++}
++
++// ------------------------------------------------------------------------------------------------ engine (core.py:1759-2172)
++struct common_recall::impl {
++    // configuration (RecallEngine.__init__ defaults, engine_from_env)
++    int    gamma           = 12;
++    int    min_match       = REC_WINDOW;
++    int    cooldown_rounds = 4;
++    int    probe_start     = 16;
++    int    probe_max       = 4096;
++    double prior           = 0.8 * 12;
++    double prior_w         = 2.0;
++    double decay           = 0.98;
++    int    min_n           = 2;
++    double own_alpha       = 0.25;
++    bool   tree            = true;  // YEE_TREE (default on): propose_select over every distinct candidate
++    int    tree_k          = 4;     // max(1, YEE_TREE_K (2)) + 2
++    bool   sync            = false; // YEE_RECALL_SYNC=1: record writes run on the caller thread
++
++    bool        ok_ = false;
++    std::string backend_ = "memory";
++    std::string dir_;
++    bool        read_only_ = false;
++    std::string stats_file_;
++    double      log_s_ = 30.0;
++    std::string tag_   = "[yee-recall] llama.cpp";
++
++    std::unique_ptr<rec_record> rec;
++    uint64_t pw1 = rec_pow_p(REC_WINDOW - 1);
++
++    // engine state (guarded by mu); the record is guarded by rmu (lock order: mu, then rmu)
++    mutable std::mutex mu;
++    std::mutex         rmu;
++    std::map<int, rec_stream> streams;
++    rec_stat stats[2][4];
++    int      probe_iv[2]   = { 16, 16 };
++    int      probe_left[2] = { 16, 16 };
++    double   own_global    = 6.0;
++    int64_t  offers = 0, probes = 0, tree_selects = 0, landed_tokens = 0, unused = 0, lookups = 0, rounds_own = 0;
++    int64_t  streams_begun = 0, gc_streams = 0, used_n = 0, lock_skips = 0, ticks = 0;
++    int64_t  offers_src[2]  = { 0, 0 };
++    int64_t  offers_tier[4] = { 0, 0, 0, 0 };
++    std::string last_clear;
++    double   last_tick = -1e30;
++    double   last_log  = 0.0;
++    std::atomic<int64_t> errors{ 0 };
++    std::atomic<int>     err_printed{ 0 };
++
++    // background writer
++    std::thread             th;
++    std::mutex              qmu;
++    std::condition_variable qcv;
++    std::condition_variable qdone;
++    std::deque<rec_job>     q;
++    bool                    busy = false;
++    bool                    stop = false;
++
++    void error(const char * what, const std::string & msg) {
++        errors.fetch_add(1);
++        if (err_printed.fetch_add(1) < 5) {
++            LOG_WRN("%s %s failed (recall skips this call): %s\n", tag_.c_str(), what, msg.c_str());
++        }
++    }
++
++    double expect(int src, int tier) const {
++        const rec_stat & s = stats[src][tier];
++        const double pr = prior * (tier == REC_SHORT_TIER ? 0.5 : 1.0);
++        return (s.s + pr * prior_w) / (s.n + prior_w);
++    }
++
++    // -------------------------------------------------------------- writer
++    void run_job(rec_job & job) {
++        try {
++            if (job.kind == 1) {
++                std::lock_guard<std::mutex> lk(rmu);
++                rec->add(job.ids);
++            } else if (job.kind == 2) {
++                do_clear();
++            } else if (job.kind == 3) {
++                write_stats(job.text);
++            }
++        } catch (const std::exception & e) {
++            std::lock_guard<std::mutex> lk(rmu);
++            rec->last_error = e.what();
++            error("record write", e.what());
++        }
++    }
++
++    void writer_loop() {
++        for (;;) {
++            rec_job job;
++            {
++                std::unique_lock<std::mutex> lk(qmu);
++                qcv.wait(lk, [&] { return stop || !q.empty(); });
++                if (q.empty()) {
++                    return;
++                }
++                job = std::move(q.front());
++                q.pop_front();
++                busy = true;
++            }
++            run_job(job);
++            {
++                std::lock_guard<std::mutex> lk(qmu);
++                busy = false;
++            }
++            qdone.notify_all();
++        }
++    }
++
++    void submit(rec_job && job) {
++        if (sync || !th.joinable()) {
++            run_job(job);
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lk(qmu);
++            q.push_back(std::move(job));
++        }
++        qcv.notify_one();
++    }
++
++    void flush() {
++        if (sync || !th.joinable()) {
++            return;
++        }
++        std::unique_lock<std::mutex> lk(qmu);
++        qdone.wait_for(lk, std::chrono::seconds(30), [&] { return q.empty() && !busy; });
++    }
++
++    void do_clear() {
++        std::lock_guard<std::mutex> lk(mu);
++        std::lock_guard<std::mutex> lr(rmu);
++        const std::string err = rec->clear();
++        if (!err.empty()) {
++            last_clear = "error " + err;
++            return;
++        }
++        for (auto & row : stats) {
++            for (auto & s : row) {
++                s = rec_stat();
++            }
++        }
++        offers = probes = landed_tokens = unused = lookups = 0;
++        last_clear = "ok " + rec_utc_stamp();
++    }
++
++    void write_stats(const std::string & text) {
++        if (stats_file_.empty()) {
++            return;
++        }
++        std::error_code ec;
++        const fs::path p(stats_file_);
++        if (p.has_parent_path()) {
++            fs::create_directories(p.parent_path(), ec);
++        }
++        const std::string tmp = stats_file_ + ".tmp";
++        {
++            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
++            f << text;
++            if (!f.good()) {
++                throw std::runtime_error("cannot write " + tmp);
++            }
++        }
++        fs::rename(tmp, stats_file_, ec);
++        if (ec) {
++            throw std::runtime_error("cannot rename " + tmp + ": " + ec.message());
++        }
++    }
++
++    // -------------------------------------------------------------- candidates (core.py:1933-2059)
++    bool own_candidate(const rec_stream & st, int n_tok, rec_cand & c) const {
++        const int64_t p = st.prev;
++        const int64_t n = (int64_t) st.ctx.size();
++        if (p < REC_WINDOW || p >= n) {
++            return false;
++        }
++        const int64_t * ctx = st.ctx.data();
++        for (int i = 0; i < REC_WINDOW; ++i) {
++            if (ctx[p - REC_WINDOW + i] != ctx[n - REC_WINDOW + i]) {
++                return false;
++            }
++        }
++        const int64_t back = std::min<int64_t>(REC_MAX_BACK - REC_WINDOW, p - REC_WINDOW);
++        int64_t ext = 0;
++        while (ext < back && ctx[p - REC_WINDOW - 1 - ext] == ctx[n - REC_WINDOW - 1 - ext]) {
++            ++ext;
++        }
++        const int L = REC_WINDOW + (int) ext;
++        if (L < min_match) {
++            return false;
++        }
++        const int64_t period = n - p;
++        c.toks.assign((size_t) n_tok, 0);
++        if (period >= n_tok) {
++            for (int j = 0; j < n_tok; ++j) {
++                c.toks[(size_t) j] = ctx[p + j];
++            }
++        } else {
++            for (int64_t j = 0; j < period; ++j) {
++                c.toks[(size_t) j] = ctx[p + j];
++            }
++            for (int64_t j = period; j < n_tok; ++j) {
++                c.toks[(size_t) j] = c.toks[(size_t) (j - period)];
++            }
++        }
++        c.src  = 0;
++        c.tier = rec_tier_of(L);
++        c.L    = L;
++        c.real = n_tok;
++        c.pos  = -1;
++        return true;
++    }
++
++    // continuation of a record hit as a candidate (shared by _record_candidate and candidates)
++    bool record_cont(int64_t p, int L, int n_tok, rec_cand & c) {
++        if (L >= REC_WINDOW && L < min_match) {
++            return false;
++        }
++        std::vector<int64_t> cont;
++        if (!rec->continuation(p, n_tok, std::min(min_n, n_tok), cont)) {
++            return false;
++        }
++        if (L < REC_WINDOW && (int) cont.size() > 2 * L) {
++            cont.resize((size_t) (2 * L));
++        }
++        const int real = (int) cont.size();
++        if (real < n_tok) {
++            cont.resize((size_t) n_tok, cont.back());
++        }
++        c.src  = 1;
++        c.tier = rec_tier_of(L);
++        c.L    = L;
++        c.toks = std::move(cont);
++        c.real = real;
++        c.pos  = p;
++        return true;
++    }
++
++    bool record_candidate(rec_stream & st, int n_tok, rec_cand & c) {
++        if (rec->end() - rec->base() < REC_WINDOW) {
++            return false;
++        }
++        lookups += 1;
++        const int64_t n  = (int64_t) st.ctx.size();
++        const int64_t t0 = std::max<int64_t>(0, n - REC_MAX_BACK);
++        int64_t p = 0;
++        int     L = 0;
++        if (!rec->lookup(st.ctx.data() + t0, n - t0, REC_MAX_BACK, &st.h, p, L)) {
++            return false;
++        }
++        return record_cont(p, L, n_tok, c);
++    }
++
++    void candidates(rec_stream & st, int n_tok, int k, std::vector<rec_cand> & kept) {
++        kept.clear();
++        if ((int64_t) st.ctx.size() < REC_WINDOW || st.cooldown > 0) {
++            return;
++        }
++        std::vector<rec_cand> out;
++        rec_cand c;
++        if (own_candidate(st, n_tok, c)) {
++            out.push_back(c);
++        }
++        if (rec->end() - rec->base() >= REC_WINDOW) {
++            const int64_t n  = (int64_t) st.ctx.size();
++            const int64_t t0 = std::max<int64_t>(0, n - REC_MAX_BACK);
++            std::vector<std::pair<int64_t, int>> hits;
++            rec->lookup_all(st.ctx.data() + t0, n - t0, REC_MAX_BACK, &st.h, hits);
++            for (const auto & hit : hits) {
++                rec_cand rc;
++                if (record_cont(hit.first, hit.second, n_tok, rc)) {
++                    out.push_back(std::move(rc));
++                }
++            }
++        }
++        for (auto & cand : out) {
++            bool dup = false;
++            for (auto & o : kept) {
++                const int m = std::min(cand.real, o.real);
++                if (std::equal(cand.toks.begin(), cand.toks.begin() + m, o.toks.begin())) {
++                    dup = true;
++                    if ((cand.real > o.real || (cand.real == o.real && cand.L > o.L)) && cand.src == o.src) {
++                        o = cand;
++                    }
++                    break;
++                }
++            }
++            if (!dup) {
++                kept.push_back(cand);
++            }
++            if ((int) kept.size() >= k) {
++                break;
++            }
++        }
++    }
++
++    // -------------------------------------------------------------- propose / propose_select (core.py:1982-2102)
++    common_recall_proposal propose(int slot, int n, double head_ema) {
++        common_recall_proposal res;
++        auto it = streams.find(slot);
++        if (it == streams.end() || (int64_t) it->second.ctx.size() < REC_WINDOW) {
++            return res;
++        }
++        rec_stream & st = it->second;
++        if (st.cooldown > 0) {
++            st.cooldown -= 1;
++            return res;
++        }
++        const int    n_tok = n <= 0 ? gamma : std::min(n, gamma);
++        const double own   = head_ema < 0 ? st.own_ema : head_ema;
++
++        std::unique_lock<std::mutex> lr(rmu, std::try_to_lock);
++        if (!lr.owns_lock()) {
++            lock_skips += 1; // a record write is running: no candidates this step (the inference thread never waits)
++            return res;
++        }
++        rec_cand best;
++        bool     have   = false;
++        double   best_e = -1.0;
++        if (tree) {
++            std::vector<rec_cand> cands;
++            candidates(st, n_tok, tree_k, cands);
++            int rec_n = 0;
++            for (const auto & c : cands) {
++                rec_n += c.src == 1 ? 1 : 0;
++            }
++            if (rec_n) {
++                lookups += 1;
++            }
++            if (rec_n > 1) {
++                tree_selects += 1;
++            }
++            for (auto & c : cands) {
++                const double e = expect(c.src, c.tier);
++                if (e > best_e || (have && e == best_e && c.src == 1 && best.src == 1 && c.L > best.L)) {
++                    best   = c;
++                    best_e = e;
++                    have   = true;
++                }
++            }
++        } else {
++            rec_cand c;
++            if (own_candidate(st, n_tok, c)) {
++                const double e = expect(c.src, c.tier);
++                if (e > best_e) {
++                    best = c, best_e = e, have = true;
++                }
++            }
++            if (record_candidate(st, n_tok, c)) {
++                const double e = expect(c.src, c.tier);
++                if (e > best_e) {
++                    best = c, best_e = e, have = true;
++                }
++            }
++        }
++        lr.unlock();
++        if (!have) {
++            return res;
++        }
++        bool probe = false;
++        if (best_e <= own) {
++            const int left = probe_left[best.src] - 1;
++            if (left > 0) {
++                probe_left[best.src] = left;
++                return res;
++            }
++            probe_left[best.src] = probe_iv[best.src];
++            probe = true;
++            probes += 1;
++        }
++        st.pending.push_back({ best.src, best.tier, probe, best.real, own, best.pos });
++        st.offers += 1;
++        st.last_seen = rec_now();
++        offers += 1;
++        offers_src[best.src] += 1;
++        offers_tier[best.tier] += 1;
++        res.tokens.reserve(best.toks.size());
++        for (int64_t t : best.toks) {
++            res.tokens.push_back((llama_token) t);
++        }
++        res.src       = best.src + 1;
++        res.tier      = best.tier;
++        res.match_len = best.L;
++        res.expect    = best_e;
++        res.real      = best.real;
++        res.probe     = probe;
++        return res;
++    }
++
++    void feedback(int slot, int landed, bool used) {
++        auto it = streams.find(slot);
++        if (it == streams.end() || it->second.pending.empty()) {
++            return;
++        }
++        rec_stream & st = it->second;
++        const rec_pending pd = st.pending.front();
++        st.pending.pop_front();
++        if (!used) {
++            unused += 1;
++            return;
++        }
++        used_n += 1;
++        landed = std::max(0, std::min(landed, pd.real));
++        rec_stat & s = stats[pd.src][pd.tier];
++        s.s = s.s * decay + (double) landed;
++        s.n = s.n * decay + 1.0;
++        s.offers += 1;
++        s.landed += landed;
++        landed_tokens += landed;
++        if (landed == 0) {
++            st.cooldown = cooldown_rounds;
++        }
++        if (pd.probe) {
++            if ((double) landed > pd.own) {
++                probe_iv[pd.src] = probe_start;
++            } else {
++                probe_iv[pd.src] = std::min(probe_iv[pd.src] * 2, probe_max);
++            }
++            probe_left[pd.src] = probe_iv[pd.src];
++        }
++    }
++
++    json stats_locked() {
++        json tiers = json::object();
++        for (int src = 0; src < 2; ++src) {
++            for (int t = 0; t < 4; ++t) {
++                const rec_stat & s = stats[src][t];
++                tiers[std::string(REC_SRC_NAMES[src]) + "_" + REC_TIER_NAMES[t]] = {
++                    { "offers", s.offers },
++                    { "landed", s.landed },
++                    { "rate", s.offers ? json(std::round(10000.0 * (double) s.landed / (double) s.offers) / 10000.0) : json(nullptr) },
++                    { "expect", std::round(10000.0 * expect(src, t)) / 10000.0 },
++                };
++            }
++        }
++        json d;
++        {
++            std::lock_guard<std::mutex> lr(rmu);
++            d = rec->stats();
++        }
++        d["base"]           = "llama.cpp";
++        d["enabled"]        = true;
++        d["gamma"]          = gamma;
++        d["tree"]           = tree;
++        d["tree_k"]         = tree_k;
++        d["min_match"]      = min_match;
++        d["offers"]         = offers;
++        d["proposals"]      = offers;
++        d["probes"]         = probes;
++        d["tree_selects"]   = tree_selects;
++        d["landed_tokens"]  = landed_tokens;
++        d["used"]           = used_n;
++        d["unused"]         = unused;
++        d["lookups"]        = lookups;
++        d["own_rounds"]     = rounds_own;
++        d["own_global_ema"] = std::round(10000.0 * own_global) / 10000.0;
++        d["active_streams"] = (int64_t) streams.size();
++        d["streams_begun"]  = streams_begun;
++        d["gc_streams"]     = gc_streams;
++        d["probe_interval"] = { { "own", probe_iv[0] }, { "record", probe_iv[1] } };
++        d["offers_by_src"]  = { { "own", offers_src[0] }, { "record", offers_src[1] } };
++        d["offers_by_tier"] = { { REC_TIER_NAMES[0], offers_tier[0] }, { REC_TIER_NAMES[1], offers_tier[1] },
++                                { REC_TIER_NAMES[2], offers_tier[2] }, { REC_TIER_NAMES[3], offers_tier[3] } };
++        d["tiers"]          = tiers;
++        d["ticks"]          = ticks;
++        d["lock_skips"]     = lock_skips;
++        d["errors"]         = errors.load();
++        d["last_clear"]     = last_clear;
++        d["time"]           = rec_utc_stamp();
++        return d;
++    }
++
++    void log_line(const json & d) {
++        LOG_INF("%s ticks=%lld streams=%lld proposals=%lld used=%lld landed=%lld src=own:%lld,record:%lld "
++                "tier=16-31:%lld,32-63:%lld,64+:%lld,<16:%lld store_ids=%lld records=%lld evicted=%lld errors=%lld\n",
++                tag_.c_str(), (long long) ticks, (long long) streams.size(), (long long) offers, (long long) used_n,
++                (long long) landed_tokens, (long long) offers_src[0], (long long) offers_src[1], (long long) offers_tier[0],
++                (long long) offers_tier[1], (long long) offers_tier[2], (long long) offers_tier[3],
++                (long long) d.value("ids", (int64_t) 0), (long long) d.value("adds", (int64_t) 0),
++                (long long) d.value("evicted_chunks", (int64_t) 0), (long long) errors.load());
++    }
++};
++
++// ------------------------------------------------------------------------------------------------ public API
++common_recall::common_recall(const common_recall_config & cfg_in) : p_(new impl()) {
++    impl & s = *p_;
++    try {
++        common_recall_config cfg = cfg_in;
++        common_recall_config_from_env(cfg);
++        s.gamma     = std::max(1, cfg.gamma);
++        s.min_match = std::max(REC_WINDOW, cfg.min_match);
++        s.prior     = rec_env_double("prior", 0.8) * (double) s.gamma;
++        s.own_global = 0.5 * (double) s.gamma;
++        s.tree      = rec_true(rec_tree_env("TREE", "1"));
++        int tk = 2;
++        try {
++            tk = std::max(0, std::min(3, (int) std::stod(rec_tree_env("TREE_K", "2"))));
++        } catch (...) {
++            tk = 2;
++        }
++        s.tree_k = std::max(1, tk) + 2;
++        s.sync   = rec_true(rec_getenv("YEE_RECALL_SYNC"));
++        s.log_s_ = cfg.log_s;
++        s.stats_file_ = !cfg.stats_file.empty() ? cfg.stats_file : rec_home() + "/.cache/yee/recall/recall_stats_llama.cpp.json";
++        s.stats_file_ = rec_expand(s.stats_file_);
++
++        int64_t chunk_ids = REC_CHUNK_IDS;
++        const std::string ck = rec_getenv("YEE_RECALL_CHUNK_IDS"); // test hook: small chunks to exercise eviction
++        if (!ck.empty()) {
++            try {
++                chunk_ids = std::stoll(ck);
++            } catch (...) {
++                chunk_ids = REC_CHUNK_IDS;
++            }
++        }
++        const bool   ro       = cfg.read_only == 1;
++        const double min_free = rec_env_double("min_free_gib", 4.0);
++        json ident = json::object();
++        if (!cfg.identity.empty()) {
++            ident["tokenizer_digest"] = cfg.identity;
++        }
++        ident["model"] = "llama.cpp";
++        const std::string want = rec_lower(rec_env("backend", ""));
++        const bool disk = !cfg.dir.empty() && want != "memory";
++        if (disk) {
++            try {
++                s.rec = std::make_unique<rec_record>("disk", cfg.dir, ident, cfg.gib, ro, min_free, chunk_ids);
++            } catch (const std::exception & e) {
++                // a record of another tokenizer (yee.core RecallIdentityError) or an unusable directory
++                s.error("record directory", std::string(e.what()) + "; the memory backend is used instead");
++                s.rec.reset();
++            }
++        }
++        if (!s.rec) {
++            s.rec = std::make_unique<rec_record>("memory", disk ? std::string() : cfg.dir, ident, cfg.gib, ro, min_free, chunk_ids);
++        }
++        s.backend_   = s.rec->backend;
++        s.dir_       = s.rec->backend == "disk" ? s.rec->dir : std::string();
++        s.read_only_ = !s.rec->writer;
++        s.last_log   = rec_now();
++        if (!s.sync) {
++            s.th = std::thread([this] { p_->writer_loop(); });
++        }
++        s.ok_ = true;
++        LOG_INF("%s record: backend=%s dir=%s writer=%d ids=%lld cap_ids=%lld index_slots=%lld short=%zu tree=%d k=%d stats=%s\n",
++                s.tag_.c_str(), s.backend_.c_str(), s.dir_.empty() ? "-" : s.dir_.c_str(), s.rec->writer ? 1 : 0,
++                (long long) (s.rec->end() - s.rec->base()), (long long) s.rec->cap_ids, (long long) s.rec->slots,
++                s.rec->shorts.size(), s.tree ? 1 : 0, s.tree_k, s.stats_file_.c_str());
++    } catch (const std::exception & e) {
++        s.error("init", e.what());
++        s.ok_ = false;
++    }
++}
++
++common_recall::~common_recall() {
++    if (!p_) {
++        return;
++    }
++    impl & s = *p_;
++    try {
++        if (s.th.joinable()) {
++            s.flush();
++            {
++                std::lock_guard<std::mutex> lk(s.qmu);
++                s.stop = true;
++            }
++            s.qcv.notify_all();
++            s.th.join();
++        }
++        if (s.rec) {
++            std::lock_guard<std::mutex> lr(s.rmu);
++            s.rec->store.flush();
++            s.rec->store.close();
++        }
++    } catch (...) {
++    }
++}
++
++bool common_recall::ok() const { return p_ && p_->ok_; }
++const std::string & common_recall::backend() const { return p_->backend_; }
++const std::string & common_recall::dir() const { return p_->dir_; }
++bool common_recall::read_only() const { return p_->read_only_; }
++int  common_recall::gamma() const { return p_->gamma; }
++
++void common_recall::begin_stream(int slot, const llama_token * prompt, size_t n_prompt, size_t cached_len) {
++    if (!ok()) {
++        return;
++    }
++    impl & s = *p_;
++    try {
++        std::vector<int64_t> p(prompt, prompt + n_prompt);
++        bool writer = false;
++        {
++            std::lock_guard<std::mutex> lk(s.mu);
++            rec_stream st;
++            st.own_ema = s.own_global;
++            const size_t nt = std::min<size_t>(64, p.size());
++            st.prompt_tail.assign(p.end() - (std::ptrdiff_t) nt, p.end());
++            const size_t nb = std::min<size_t>(REC_MAX_BACK, p.size());
++            st.append(p.data() + (p.size() - nb), nb, s.pw1);
++            st.last_seen = rec_now();
++            s.streams[slot] = std::move(st);
++            s.streams_begun += 1;
++            writer = s.rec->writer;
++        }
++        const size_t from = std::min(cached_len, p.size());
++        if (p.size() - from >= (size_t) REC_WINDOW && writer) {
++            rec_job job;
++            job.kind = 1;
++            job.ids.assign(p.begin() + (std::ptrdiff_t) from, p.end());
++            s.submit(std::move(job));
++        }
++    } catch (const std::exception & e) {
++        s.error("begin_stream", e.what());
++    }
++}
++
++void common_recall::extend_stream(int slot, const llama_token * toks, size_t n) {
++    if (!ok() || n == 0) {
++        return;
++    }
++    impl & s = *p_;
++    try {
++        std::lock_guard<std::mutex> lk(s.mu);
++        auto it = s.streams.find(slot);
++        if (it == s.streams.end()) {
++            return;
++        }
++        std::vector<int64_t> t(toks, toks + n);
++        it->second.append(t.data(), t.size(), s.pw1);
++        it->second.out_len += (int64_t) n;
++        it->second.last_seen = rec_now();
++    } catch (const std::exception & e) {
++        s.error("extend_stream", e.what());
++    }
++}
++
++void common_recall::end_stream(int slot, bool finished) {
++    if (!ok()) {
++        return;
++    }
++    impl & s = *p_;
++    try {
++        rec_job job;
++        {
++            std::lock_guard<std::mutex> lk(s.mu);
++            auto it = s.streams.find(slot);
++            if (it == s.streams.end()) {
++                return;
++            }
++            rec_stream st = std::move(it->second);
++            s.streams.erase(it);
++            if (!finished || !s.rec->writer || st.out_len <= 0) {
++                return;
++            }
++            const size_t no = (size_t) std::min<int64_t>(st.out_len, (int64_t) st.ctx.size());
++            job.ids = st.prompt_tail;
++            job.ids.insert(job.ids.end(), st.ctx.end() - (std::ptrdiff_t) no, st.ctx.end());
++        }
++        if (job.ids.size() >= (size_t) REC_WINDOW) {
++            job.kind = 1;
++            s.submit(std::move(job));
++        }
++    } catch (const std::exception & e) {
++        s.error("end_stream", e.what());
++    }
++}
++
++bool common_recall::has_stream(int slot) const {
++    if (!ok()) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lk(p_->mu);
++    return p_->streams.count(slot) > 0;
++}
++
++common_recall_proposal common_recall::propose(int slot, int n, double head_ema) {
++    if (!ok()) {
++        return {};
++    }
++    impl & s = *p_;
++    try {
++        std::lock_guard<std::mutex> lk(s.mu);
++        return s.propose(slot, n, head_ema);
++    } catch (const std::exception & e) {
++        s.error("propose", e.what());
++        return {};
++    }
++}
++
++void common_recall::feedback(int slot, int landed, bool used) {
++    if (!ok()) {
++        return;
++    }
++    impl & s = *p_;
++    try {
++        std::lock_guard<std::mutex> lk(s.mu);
++        s.feedback(slot, landed, used);
++    } catch (const std::exception & e) {
++        s.error("feedback", e.what());
++    }
++}
++
++void common_recall::observe_own(int slot, int accepted) {
++    if (!ok()) {
++        return;
++    }
++    impl & s = *p_;
++    try {
++        std::lock_guard<std::mutex> lk(s.mu);
++        const double a = s.own_alpha;
++        auto it = s.streams.find(slot);
++        if (it != s.streams.end()) {
++            it->second.own_ema = (1.0 - a) * it->second.own_ema + a * (double) accepted;
++        }
++        s.own_global = 0.99 * s.own_global + 0.01 * (double) accepted;
++        s.rounds_own += 1;
++    } catch (const std::exception & e) {
++        s.error("observe_own", e.what());
++    }
++}
++
++void common_recall::tick() {
++    if (!ok()) {
++        return;
++    }
++    impl & s = *p_;
++    const double now = rec_now();
++    if (now - s.last_tick < 2.0) {
++        return;
++    }
++    try {
++        bool want_clear = false;
++        bool writer     = false;
++        json d;
++        {
++            std::lock_guard<std::mutex> lk(s.mu);
++            s.last_tick = now;
++            s.ticks += 1;
++            {
++                std::lock_guard<std::mutex> lr(s.rmu);
++                want_clear = s.rec->poll_clear_request();
++                writer     = s.rec->writer;
++            }
++            if (want_clear && !writer) {
++                s.last_clear = "refused: read-only";
++            }
++            for (auto it = s.streams.begin(); it != s.streams.end();) {
++                if (now - it->second.last_seen > 600.0) {
++                    it = s.streams.erase(it);
++                    s.gc_streams += 1;
++                } else {
++                    ++it;
++                }
++            }
++            d = s.stats_locked();
++            if (s.log_s_ >= 0 && now - s.last_log >= s.log_s_) {
++                s.last_log = now;
++                s.log_line(d);
++            }
++        }
++        if (want_clear && writer) {
++            rec_job job;
++            job.kind = 2;
++            s.submit(std::move(job));
++        }
++        rec_job js;
++        js.kind = 3;
++        js.text = d.dump();
++        s.submit(std::move(js));
++    } catch (const std::exception & e) {
++        s.error("tick", e.what());
++    }
++}
++
++void common_recall::clear() {
++    if (!ok()) {
++        return;
++    }
++    impl & s = *p_;
++    try {
++        rec_job job;
++        job.kind = 2;
++        s.submit(std::move(job));
++        s.flush();
++    } catch (const std::exception & e) {
++        s.error("clear", e.what());
++    }
++}
++
++std::string common_recall::stats_json() {
++    if (!ok()) {
++        return "{\"base\":\"llama.cpp\",\"enabled\":false}";
++    }
++    impl & s = *p_;
++    try {
++        std::lock_guard<std::mutex> lk(s.mu);
++        return s.stats_locked().dump();
++    } catch (const std::exception & e) {
++        s.error("stats", e.what());
++        return "{}";
++    }
++}
++
++void common_recall::flush() {
++    if (!ok()) {
++        return;
++    }
++    p_->flush();
++}
+diff --git a/common/recall.h b/common/recall.h
+new file mode 100644
+index 000000000..df72e8fd6
+--- /dev/null
++++ b/common/recall.h
+@@ -0,0 +1,79 @@
++#pragma once
++
++// Yee Recall for llama-server: cross-request copy drafts (C++ port of yee.core RecallRecord + RecallEngine).
++
++#include "llama.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++struct common_recall_config {
++    std::string dir;                // record directory; "" = memory backend (records live for the process only)
++    std::string identity;           // tokenizer identity (common_recall_vocab_identity); a disk record with another identity is refused
++    double      gib       = -1.0;   // capacity in GiB; < 0 = env / yee.core default
++    int         read_only = -1;     // -1 = env / default (off), 0 = off, 1 = on
++    int         gamma     = 12;     // longest proposal (launch K)
++    int         min_match = -1;     // < 0 = env / yee.core default
++    std::string stats_file;         // "" = $YEE_RECALL_STATS_FILE, else ~/.cache/yee/recall/recall_stats_llama.cpp.json
++    double      log_s     = -1.0;   // < 0 = $YEE_RECALL_LOG_S, else 30
++};
++
++// RECALL_ACCEL (or YEE_RECALL) is 1 / true / yes / on
++bool common_recall_env_enabled();
++
++// fill the fields that are still unset from the environment (names of yee.core ENV_NEW, e.g. RECALL_ACCEL_DIR)
++void common_recall_config_from_env(common_recall_config & cfg);
++
++// stable identity of a vocabulary: hex sha256 over n_vocab and every token piece
++std::string common_recall_vocab_identity(const struct llama_vocab * vocab);
++
++struct common_recall_proposal {
++    std::vector<llama_token> tokens;  // empty = no proposal
++    int    src       = 0;             // 0 none, 1 own context of the request, 2 record (cross-request)
++    int    tier      = -1;            // yee.core tier_of(match_len)
++    int    match_len = 0;
++    double expect    = 0.0;           // expected landed tokens
++    int    real      = 0;             // leading tokens copied from the source; the rest repeats the last one (yee.core Proposal.real)
++    bool   probe     = false;         // offered although expect <= the head's average (yee.core probe)
++};
++
++class common_recall {
++public:
++    explicit common_recall(const common_recall_config & cfg);
++    ~common_recall();                       // flushes pending writes and joins the background thread
++
++    bool ok() const;                        // false: construction failed (logged); then every call is a no-op
++    const std::string & backend() const;    // "memory" | "disk"
++    const std::string & dir() const;        // resolved record directory ("" for memory)
++    bool read_only() const;
++    int  gamma() const;
++
++    // one stream per server slot
++    void begin_stream(int slot, const llama_token * prompt, size_t n_prompt, size_t cached_len);
++    void extend_stream(int slot, const llama_token * toks, size_t n);
++    void end_stream(int slot, bool finished);
++    bool has_stream(int slot) const;
++
++    // proposal for the current end of the slot's stream, at most n tokens (n is clamped to gamma);
++    // head_ema < 0: no draft head (recall only); >= 0: the head's own expected landed tokens per round
++    common_recall_proposal propose(int slot, int n, double head_ema);
++    // after the target verified a proposal: landed = accepted proposal tokens (bonus excluded)
++    void feedback(int slot, int landed, bool used);
++    // after the target verified a draft of the draft head: accepted draft tokens (yee.core observe_own);
++    // propose(..., head_ema < 0) compares the record with this per-slot average
++    void observe_own(int slot, int accepted);
++
++    void tick();                            // once per server loop
++    void clear();                           // drop every record (yee clear)
++    std::string stats_json();
++
++    // test hook: wait until every queued record write has been applied (the parity replay uses it)
++    void flush();
++
++private:
++    struct impl;
++    std::unique_ptr<impl> p_;
++};
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 7bddecf85..556dcc5a4 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -20,6 +20,7 @@
+ #include "sampling.h"
+ #include "speculative.h"
+ #include "kad.h"
++#include "recall.h"
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
+ #include "base64.hpp"
+@@ -60,8 +61,14 @@ static common_speculative_output_limits server_output_limits(const common_params
+         return { params.n_batch, 1 };
+     }
+ 
++    int32_t n_draft_out = common_speculative_n_max(&params.speculative);
++    if (params.speculative.recall || common_recall_env_enabled()) {
++        // Yee recall drafts up to recall_n tokens per step, also without a draft head
++        n_draft_out = std::max<int32_t>(n_draft_out, params.speculative.recall_n);
++    }
++
+     auto result = common_speculative_get_output_limits(
+-            params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
++            params.n_batch, params.n_parallel, n_draft_out);
+ 
+     result.total   = std::max<int32_t>(1, result.total);
+     result.per_seq = std::max<int32_t>(1, result.per_seq);
+@@ -303,6 +310,13 @@ struct server_slot {
+     bool spec_is_replay = false;
+     std::mt19937 spec_synth_rng;
+ 
++    // Yee recall (owned by server_context_impl, null when off)
++    common_recall * recall = nullptr;
++    bool recall_ok   = false; // this request drafts from recall: text only, no grammar
++    bool recall_used = false; // the draft of this step came from recall (feedback pending)
++    bool recall_skip = false; // the draft head skipped this step (draft-simple only)
++    llama_tokens recall_draft;
++
+     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
+     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
+     std::unique_ptr<const server_task> task;
+@@ -560,7 +574,7 @@ struct server_slot {
+     }
+ 
+     bool can_speculate() const {
+-        return !!spec;
++        return !!spec || recall_ok;
+     }
+ 
+     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
+@@ -658,6 +672,11 @@ struct server_slot {
+         if (is_processing()) {
+             GGML_ASSERT(task);
+ 
++            if (recall && recall_ok) {
++                // a normal end (EOS, stop word, length limit) records the output; cancel and errors do not
++                recall->end_stream(id, stop != STOP_TYPE_NONE);
++            }
++
+             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+ 
+             t_last_used = ggml_time_us();
+@@ -679,6 +698,11 @@ struct server_slot {
+ 
+             reset();
+ 
++            recall_ok   = false;
++            recall_used = false;
++            recall_skip = false;
++            recall_draft.clear();
++
+             callback_on_release(id);
+         }
+     }
+@@ -1093,6 +1117,8 @@ private:
+ 
+     common_speculative_ptr spec;
+     std::unique_ptr<common_kad> kad; // Yee KAD (--kad / LLAMA_ARG_KAD / YEE_KAD=1), null when off
++    std::unique_ptr<common_recall> recall; // Yee recall (--recall / LLAMA_ARG_RECALL / RECALL_ACCEL=1), null when off
++    bool recall_skip_head = false;          // the draft head may skip a step that recall drafts (draft-simple only)
+ 
+     bool add_bos_token = true;
+ 
+@@ -1506,6 +1532,52 @@ private:
+             }
+         }
+ 
++        // Yee recall: cross-request copy drafts, with or without a draft head (needs sequence removal like any draft)
++        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO &&
++                (params_base.speculative.recall || common_recall_env_enabled())) {
++            if (params_base.speculative.has_synth()) {
++                SRV_WRN("%s", "[yee-recall] llama.cpp disabled: synthetic acceptance replaces verification\n");
++            } else {
++                common_recall_config rcfg;
++                rcfg.dir       = params_base.speculative.recall_dir;
++                rcfg.read_only = params_base.speculative.recall_read_only ? 1 : -1;
++                rcfg.gib       = params_base.speculative.recall_gib;
++                rcfg.gamma     = std::max(1, (int) params_base.speculative.recall_n);
++                rcfg.identity  = common_recall_vocab_identity(vocab);
++                common_recall_config_from_env(rcfg);
++                recall = std::make_unique<common_recall>(rcfg);
++                if (!recall->ok()) {
++                    SRV_WRN("%s", "[yee-recall] llama.cpp could not start, recall stays off\n");
++                    recall.reset();
++                } else {
++                    std::string head = "none";
++                    if (spec) {
++                        head.clear();
++                        for (const auto t : params_base.speculative.types) {
++                            if (t == COMMON_SPECULATIVE_TYPE_NONE) {
++                                continue;
++                            }
++                            head += (head.empty() ? "" : ",") + common_speculative_type_to_str(t);
++                        }
++                        if (head.empty()) {
++                            head = "draft";
++                        }
++                    }
++                    recall_skip_head = std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
++                            [](enum common_speculative_type t) {
++                                return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE;
++                            });
++                    if (!kad && (params_base.speculative.kad || common_kad_env_enabled())) {
++                        // recall only: KAD runs with launch K = recall_n
++                        kad = std::make_unique<common_kad>("llama.cpp", params_base.speculative.kad_policy, recall->gamma());
++                    }
++                    LOG_INF("[yee-recall] llama.cpp enabled: backend=%s dir=%s read_only=%d gamma=%d head=%s\n",
++                            recall->backend().c_str(), recall->dir().empty() ? "-" : recall->dir().c_str(),
++                            recall->read_only() ? 1 : 0, recall->gamma(), head.c_str());
++                }
++            }
++        }
++
+         if (ctx_dft) {
+             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+         }
+@@ -1531,6 +1603,7 @@ private:
+             slot.ctx_dft = ctx_dft;
+             slot.mem.init(ctx_tgt, ctx_dft);
+             slot.spec    = spec.get();
++            slot.recall  = recall.get();
+             slot.n_ctx   = n_ctx_slot();
+ 
+             slot.mctx                   = mctx;
+@@ -2141,11 +2214,85 @@ private:
+         return true;
+     }
+ 
++    // Yee recall: a request starts generating (prompt evaluated); text-only plain completions use recall
++    void recall_begin(server_slot & slot) {
++        slot.recall_ok   = false;
++        slot.recall_used = false;
++        slot.recall_skip = false;
++        slot.recall_draft.clear();
++        if (!recall || !slot.task) {
++            return;
++        }
++        const bool text_only = !slot.prompt.tokens.has_mtmd && slot.inp_embd.empty() && !slot.audio_stream;
++        const bool plain     = slot.task->params.sampling.grammar.type == COMMON_GRAMMAR_TYPE_NONE;
++        const bool generate  = slot.task->type != SERVER_TASK_TYPE_TTS && slot.task->type != SERVER_TASK_TYPE_REALTIME;
++        if (!text_only || !plain || !generate) {
++            return;
++        }
++        const llama_tokens toks = slot.prompt.tokens.get_text_tokens();
++        const int64_t cached = std::min<int64_t>(std::max<int64_t>(0, (int64_t) slot.stats.n_prompt_cached), (int64_t) toks.size());
++        recall->begin_stream(slot.id, toks.data(), toks.size(), (size_t) cached);
++        slot.recall_ok = recall->has_stream(slot.id);
++    }
++
++    // Yee recall: draft width of this step; a recall proposal goes to slot.recall_draft (cut to the width)
++    int recall_width(server_slot & slot, int n_draft_max) {
++        slot.recall_used = false;
++        slot.recall_skip = false;
++        slot.recall_draft.clear();
++        if (recall && slot.recall_ok) {
++            const int n_rec = spec ? std::min(n_draft_max, (int) common_speculative_n_max(spec.get())) : n_draft_max;
++            if (n_rec > 0) {
++                // with a head, compare with the head's own average (observe_own); recall only: any copy beats 1 token per step
++                common_recall_proposal prop = recall->propose(slot.id, n_rec, spec ? -1.0 : 0.0);
++                if (!prop.tokens.empty()) {
++                    slot.recall_draft = std::move(prop.tokens);
++                    if (prop.real > 0 && prop.real < (int) slot.recall_draft.size()) {
++                        slot.recall_draft.resize(prop.real); // the padding after the copied ids is not worth verifying
++                    }
++                    slot.recall_used  = true;
++                    if (kad) {
++                        kad->mark_hot(slot.id);
++                    }
++                }
++            }
++        }
++        if (!spec && !slot.recall_used) {
++            return 0; // recall only and nothing to copy: plain one-token step
++        }
++        const bool structured = slot.task->params.sampling.grammar.type != COMMON_GRAMMAR_TYPE_NONE;
++        const int  n_width    = kad ? kad->width(slot.id, n_draft_max, structured) : n_draft_max;
++        if (slot.recall_used) {
++            if ((int) slot.recall_draft.size() > n_width) {
++                slot.recall_draft.resize(std::max(1, n_width));
++            }
++            slot.recall_skip = spec && recall_skip_head;
++        }
++        return n_width;
++    }
++
++    // Yee recall: the target verified the draft of this slot (n_acc accepted draft tokens, bonus excluded)
++    void recall_verified(server_slot & slot, int n_acc) {
++        if (!recall || !slot.recall_ok) {
++            return;
++        }
++        if (slot.recall_used) {
++            recall->feedback(slot.id, n_acc, true);
++            slot.recall_used = false;
++        } else if (spec) {
++            recall->observe_own(slot.id, n_acc);
++        }
++    }
++
+     bool process_token(completion_token_output & result, server_slot & slot) {
+         // remember which tokens were sampled - used for repetition penalties during sampling
+         const std::string token_str = result.text_to_send;
+         slot.sampled = result.tok;
+ 
++        if (recall && slot.recall_ok) {
++            recall->extend_stream(slot.id, &result.tok, 1);
++        }
++
+         slot.generated.append(token_str, result.tok);
+         if (slot.task->params.return_tokens) {
+             slot.generated_tokens.push_back(result.tok);
+@@ -3842,11 +3989,16 @@ private:
+ 
+         std::vector<server_slot *> generating;
+         std::vector<server_slot *> drafting;
++        bool head_drafting = false; // a draft head drafts for at least one slot
+ 
+         if (kad) {
+             kad->begin_step();
+         }
+ 
++        if (recall) {
++            recall->tick();
++        }
++
+         // determine which slots are generating and drafting
+         iterate(slots, [&](server_slot & slot) {
+             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+@@ -3866,8 +4018,10 @@ private:
+ 
+             generating.push_back(&slot);
+ 
+-            if (spec) {
+-                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
++            if (spec || slot.recall_ok) {
++                if (spec) {
++                    common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
++                }
+ 
+                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+@@ -3901,33 +4055,47 @@ private:
+ 
+                         const bool spec_reject = slot.use_spec_rejection();
+ 
+-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
+-                            /* .drafting = */ true,
+-                            /* .n_max    = */ kad ? kad->width(slot.id, n_draft_max,
+-                                                           slot.task->params.sampling.grammar.type != COMMON_GRAMMAR_TYPE_NONE)
+-                                                : n_draft_max,
+-                            /* .pos0     = */ slot.prompt.tokens.pos_next(),
+-                            /* .id_last  = */ slot.sampled,
+-                            /* .prompt   = */ &slot.spec_prompt,
+-                            /* .result   = */ &slot.spec_draft,
+-                            /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+-                            /* .temp     = */ slot.task->params.sampling.temp,
+-                            /* .seed     = */ slot.task->params.sampling.seed,
+-                        };
+-
+-                        drafting.push_back(&slot);
++                        // Yee recall: ask the record first; a proposal makes the KAD width hot
++                        const int n_width = recall_width(slot, n_draft_max);
++
++                        if (spec && !slot.recall_skip) {
++                            common_speculative_get_draft_params(spec.get(), slot.id) = {
++                                /* .drafting = */ true,
++                                /* .n_max    = */ n_width,
++                                /* .pos0     = */ slot.prompt.tokens.pos_next(),
++                                /* .id_last  = */ slot.sampled,
++                                /* .prompt   = */ &slot.spec_prompt,
++                                /* .result   = */ &slot.spec_draft,
++                                /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
++                                /* .temp     = */ slot.task->params.sampling.temp,
++                                /* .seed     = */ slot.task->params.sampling.seed,
++                            };
++                            head_drafting = true;
++                        }
++
++                        if (spec || slot.recall_used) {
++                            drafting.push_back(&slot);
++                        }
+                     }
+                 }
+             }
+         });
+ 
+         // generate the actual drafts (if any)
+-        if (!drafting.empty()) {
++        if (head_drafting) {
+             queue_tasks.yield_to_queue([&]() {
+                 common_speculative_draft(spec.get());
+             });
+         }
+ 
++        // Yee recall: the recall proposal is the draft of its slot (a head that cannot skip a step drafted as usual)
++        iterate(drafting, [&](server_slot & slot) {
++            if (slot.recall_used) {
++                slot.spec_draft = slot.recall_draft;
++                slot.spec_draft_q.clear();
++            }
++        });
++
+         // make checkpoints if needed
+         iterate(drafting, [&](server_slot & slot) {
+             auto & draft = slot.spec_draft;
+@@ -4869,6 +5037,8 @@ private:
+                 // prompt evaluated for next-token prediction
+                 slot.state = SLOT_STATE_GENERATING;
+ 
++                recall_begin(slot);
++
+                 if (slot.can_speculate()) {
+                     if (kad) {
+                         kad->release(slot.id);
+@@ -4951,7 +5121,8 @@ private:
+ 
+                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
+                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
+-                const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
++                static const std::vector<double> recall_no_synth;
++                const auto & synth_probs = spec ? common_speculative_get_synth_probs(spec.get()) : recall_no_synth;
+ 
+                 // drafters that fill no distribution fall back here
+                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+@@ -4991,6 +5162,8 @@ private:
+                             kad->observe(slot.id, (int) n_draft, (int) accepted.size() - 1);
+                         }
+ 
++                        recall_verified(slot, (int) accepted.size() - 1);
++
+                         slot.spec_is_replay = true;
+                         slot.spec_draft = std::move(accepted);
+ 
+@@ -5021,7 +5194,14 @@ private:
+                     kad->observe(slot.id, (int) n_draft, (int) accepted.size() - 1);
+                 }
+ 
+-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
++                if (!slot.spec_is_replay) {
++                    recall_verified(slot, (int) accepted.size() - 1);
++                }
++
++                if (spec && !slot.recall_skip) {
++                    common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
++                }
++                slot.recall_skip = false;
+ 
+                 slot.spec_draft = std::move(accepted);
+             }

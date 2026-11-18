@@ -18,7 +18,7 @@
 
 | 加速头（`--speculative-algorithm`） | 适配器 | 状态 | 原因 / 注入点 |
 |---|---|---|---|
-| `DSPARK` | `sglang_dspark` | verified | `DSparkWorkerV2._proposer.propose` 的输出；已在 ysy37–40（Mia 镜像）实测 |
+| `DSPARK` | `sglang_dspark` | verified | `DSparkWorkerV2._proposer.propose` 的输出；已在 4 台 DGX Spark（Mia 镜像）实测。DeepSeek-V4.1-Flash 上块长 7 + `DSV41_VERIFY_CAP=conf:0.1` 比块长 12 快：块长 12（static 或 compact 变长验证）合计慢 5%～12%。这条路径的验证矩形整批固定，KAD 是 native，逐请求宽度靠 conf 截断（3.5.0 起可选 `mia-dsv41-vcap` 按请求算门槛） |
 | `DFLASH` | `sglang_dflash` | container | `DFlashWorkerV2` 的块草稿；构造 `DFlashVerifyInput` 之前改写 `_draft_block_tokens_buf` |
 | `EAGLE` | `sglang_eagle` | container | `build_eagle_verify_input`，在 `build_tree_kernel_efficient` 之前替换 `draft_tokens` |
 | `EAGLE3` | `sglang_eagle` | container | 与 EAGLE 同一条路径 |
@@ -33,7 +33,7 @@
 
 别名归并规则：`EAGLE-3` → `EAGLE3`，`DEEPSEEK_MTP` / `QWEN3_NEXT_MTP` / `MIMO_MTP` / `ERNIE_MTP` / `GLM4_MOE_MTP` / `LONGCAT_FLASH_MTP` → `MTP`，`DFLASH2` → `DFLASH`，`NGRAM_GPU` → `NGRAM`。
 
-已验证版本：SGLang `0.0.0.dev0`（镜像 `dsv41-4x-spark:canary-roce-pd`）。
+已验证版本：SGLang `0.0.0.dev0`（镜像 `dsv41-4x-spark`）。
 
 ## 3. vLLM（V2 runner）
 
@@ -50,6 +50,8 @@
 已验证版本：vLLM `0.28.1rc1.dev388+g8a728663c`（镜像 `vllm-dsv41-x86:compat6`）。
 
 **必须设 `VLLM_USE_V2_MODEL_RUNNER=1`**，否则钩子装不上。
+
+KAD（逐请求自适应草稿数，`K_max` 12）对上表全部 `method` 生效，各头的草稿侧路径见 `yee doc kad`；ngram、suffix 等在 vLLM 0.31 的 V2 runner 下不支持，只有切到 V1 runner（`VLLM_USE_V2_MODEL_RUNNER=0`）时才有调度器侧截短。
 
 ## 4. TensorFold
 
@@ -84,7 +86,29 @@ CUDA 上单流 Nemotron 的自有驱动会在上下文没东西可复制时问�
 | 带 penalty 的请求 | 不走投机 | 需要在 verify 里逐位累计 penalty，改动面大，本轮未做 |
 | grammar / logprobs | 排除 | 同上 |
 
-## 7. 全局的限制
+## 7. strata（3.5.1，C++ MoE 引擎）
+
+| 项 | 状态 | 原因 |
+|---|---|---|
+| MTP 草稿（`--mtp`）的单流窗口 | 需 Yee 补丁 | token 循环在 C++ 进程里，用 git-patch `strata-recall` 接入；召回提议按 prompt-lookup 草稿的路径进窗口 |
+| MTP 草稿 + `--batch-mtp` 批处理槽（rtx3080n1 线上配置） | 需 Yee 补丁 | 召回提议替换该槽这一窗口的 MTP 草稿，最多 `--spec` 减 1 个 |
+| suffix / prompt-lookup（`--suffix-draft`、`--lookup-chain`） | native | 引擎自带，只看本请求；召回补上跨请求的部分 |
+| DFlash2 批处理（`STRATA_BATCH_DF2`）、流水线 MTP（`STRATA_PIPED_MTP`） | 不接 | 这两条批处理路径的窗口布局不同，补丁不改，服务原样运行 |
+| KAD | native | 引擎自带逐窗口自适应（`--spec-min-p` + DraftPolicy），不需要 Yee 的 KAD |
+| 采样请求 | 支持 | 召回草稿按单点草稿验证，输出分布不变 |
+| 带图请求 | 不用召回 | 与 llama.cpp 补丁一致，只认纯文本 |
+
+验证状态：补丁在 712fec6b 与 rtx3080n1 源码上能干净应用，`generate.cpp` host 侧语法检查与两组单测通过；还没有在 GPU 上编译和实测，所以不标 verified。
+
+## 8. llama.cpp 的 MTP 草稿头（3.5.2）
+
+| 项 | 状态 | 原因 |
+|---|---|---|
+| MTP 草稿头截断词表（`YEE_MTP_VOCAB_N`） | 需 Yee 补丁 | git-patch `llama.cpp-mtp-vocab`，只改 qwen35 / qwen35moe 的 MTP 图；mx4 实测 k=3 快 5.0% |
+| MTP 草稿头放 CPU（`-md` 同一个 gguf、`-devd none -ngld 0`） | native | 上游就支持；mx4 上比放 GPU 慢 15%，CPU 与 GPU 共用内存的机器不建议 |
+| GPU 验证时 CPU 同时起草（重叠） | 不做 | mx4 上 GPU 忙时 CPU 读内存只剩 28% 的速度，GPU 也慢 10%；方案见 [llama-mtp.md](llama-mtp.md) 第 5 节 |
+
+## 9. 全局的限制
 
 - **跨 tokenizer 不能共用记录**：记录只认 token id，模型和基座无关，但不同 tokenizer 的记录不能混用，目录按 digest 自动隔离。
 - **grammar / 结构化输出不参与复制**。

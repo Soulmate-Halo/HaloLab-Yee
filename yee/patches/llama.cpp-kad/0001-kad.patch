@@ -1,0 +1,759 @@
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 8e3c88dac..7a6a2827b 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -109,6 +109,8 @@ add_library(${TARGET}
+     sampling.h
+     speculative.cpp
+     speculative.h
++    kad.cpp
++    kad.h
+     subproc.cpp
+     subproc.h
+     trie.cpp
+diff --git a/common/arg.cpp b/common/arg.cpp
+index e3ab084c6..1c38a2519 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4141,6 +4141,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.speculative.draft.n_max = value;
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
++    add_opt(common_arg(
++        {"--kad"},
++        "Yee KAD: per-request adaptive draft count, ladder 5..12 within --spec-draft-n-max (default: disabled)",
++        [](common_params & params) {
++            params.speculative.kad = true;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KAD"));
++    add_opt(common_arg(
++        {"--kad-policy"}, "FNAME",
++        "Yee KAD policy JSON, hot reloaded (default: $YEE_KAD_POLICY or ~/.cache/yee/kad/kad_policy.json)",
++        [](common_params & params, const std::string & value) {
++            params.speculative.kad_policy = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KAD_POLICY"));
+     add_opt(common_arg(
+         {"--spec-draft-n-min"}, "N",
+         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
+diff --git a/common/common.h b/common/common.h
+index e970fb39b..f70e0c5a6 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -392,6 +392,10 @@ struct common_params_speculative {
+ 
+     common_params_speculative_ngram_cache ngram_cache;
+ 
++    // Yee KAD (llama-server): per-request adaptive draft count within draft.n_max, see common/kad.h
++    bool        kad        = false;
++    std::string kad_policy = ""; // policy JSON, hot reloaded (empty: $YEE_KAD_POLICY or ~/.cache/yee/kad/kad_policy.json)
++
+     bool has_dft() const {
+         return !draft.mparams.empty();
+     }
+diff --git a/common/kad.cpp b/common/kad.cpp
+new file mode 100644
+index 000000000..bd1357f71
+--- /dev/null
++++ b/common/kad.cpp
+@@ -0,0 +1,471 @@
++#include "kad.h"
++
++#include "log.h"
++
++#include <nlohmann/json.hpp>
++
++#include <algorithm>
++#include <atomic>
++#include <cctype>
++#include <chrono>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <sstream>
++
++using json = nlohmann::json;
++
++static std::atomic<int> g_kad_instances{0};
++
++bool common_kad_active() {
++    return g_kad_instances.load(std::memory_order_relaxed) > 0;
++}
++
++static std::string kad_lower_trim(std::string s);
++static std::string kad_env(const char * name, const std::string & def);
++
++bool common_kad_env_enabled() {
++    const std::string v = kad_lower_trim(kad_env("YEE_KAD", ""));
++    return v == "1" || v == "true" || v == "yes" || v == "on";
++}
++
++// ------------------------------------------------------------------------------------------------ helpers
++static std::string kad_env(const char * name, const std::string & def = "") {
++    const char * v = std::getenv(name);
++    if (v == nullptr) {
++        return def;
++    }
++    std::string s(v);
++    s.erase(0, s.find_first_not_of(" \t\r\n"));
++    s.erase(s.find_last_not_of(" \t\r\n") + 1);
++    return s.empty() ? def : s;
++}
++
++static double kad_env_double(const char * name, double def) {
++    const std::string s = kad_env(name);
++    if (s.empty()) {
++        return def;
++    }
++    try {
++        return std::stod(s);
++    } catch (...) {
++        return def;
++    }
++}
++
++static std::string kad_lower_trim(std::string s) {
++    s.erase(0, s.find_first_not_of(" \t\r\n"));
++    s.erase(s.find_last_not_of(" \t\r\n") + 1);
++    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::tolower(c); });
++    return s;
++}
++
++static std::string kad_home() {
++    std::string h = kad_env("HOME");
++    if (h.empty()) {
++        h = kad_env("USERPROFILE", ".");
++    }
++    return h;
++}
++
++static std::string kad_dir() {
++    std::string d = kad_env("YEE_KAD_DIR");
++    if (d.empty()) {
++        d = kad_home() + "/.cache/yee/kad";
++    } else if (d.size() >= 2 && d[0] == '~' && (d[1] == '/' || d[1] == '\\')) {
++        d = kad_home() + d.substr(1);
++    }
++    return d;
++}
++
++static double kad_now() {
++    using namespace std::chrono;
++    return duration<double>(steady_clock::now().time_since_epoch()).count();
++}
++
++// ------------------------------------------------------------------------------------------------ sha256
++std::string common_kad_sha256_hex(const std::string & data) {
++    static const uint32_t K[64] = {
++        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++    };
++    uint32_t h[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
++    std::string m = data;
++    const uint64_t bits = (uint64_t) data.size() * 8;
++    m.push_back((char) 0x80);
++    while (m.size() % 64 != 56) {
++        m.push_back((char) 0);
++    }
++    for (int i = 7; i >= 0; --i) {
++        m.push_back((char) ((bits >> (8 * i)) & 0xff));
++    }
++    auto rotr = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
++    for (size_t off = 0; off < m.size(); off += 64) {
++        uint32_t w[64];
++        for (int i = 0; i < 16; ++i) {
++            w[i] = ((uint32_t) (uint8_t) m[off + 4 * i] << 24) | ((uint32_t) (uint8_t) m[off + 4 * i + 1] << 16) |
++                   ((uint32_t) (uint8_t) m[off + 4 * i + 2] << 8) | (uint32_t) (uint8_t) m[off + 4 * i + 3];
++        }
++        for (int i = 16; i < 64; ++i) {
++            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
++            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
++            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++        }
++        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
++        for (int i = 0; i < 64; ++i) {
++            const uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
++            const uint32_t ch = (e & f) ^ (~e & g);
++            const uint32_t t1 = hh + S1 + ch + K[i] + w[i];
++            const uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
++            const uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
++            const uint32_t t2 = S0 + mj;
++            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
++        }
++        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
++    }
++    char out[65];
++    for (int i = 0; i < 8; ++i) {
++        snprintf(out + 8 * i, 9, "%08x", h[i]);
++    }
++    return std::string(out, 64);
++}
++
++// ------------------------------------------------------------------------------------------------ policy
++bool common_kad_parse_policy(const std::string & text, common_kad_policy & out, std::string & err) {
++    json j;
++    try {
++        j = json::parse(text);
++    } catch (const std::exception & e) {
++        err = std::string("invalid JSON: ") + e.what();
++        return false;
++    }
++    if (!j.is_object()) {
++        err = "the policy must be a JSON object";
++        return false;
++    }
++    common_kad_policy p;
++    p.mode = "fixed";
++    if (j.contains("mode")) {
++        if (!j["mode"].is_string()) {
++            err = "the policy field 'mode' must be a string";
++            return false;
++        }
++        p.mode = kad_lower_trim(j["mode"].get<std::string>());
++    }
++    if (p.mode != "off" && p.mode != "fixed" && p.mode != "ladder") {
++        err = "unknown policy mode '" + p.mode + "'";
++        return false;
++    }
++    if (j.contains("down")) {
++        if (!j["down"].is_string()) {
++            err = "the policy field 'down' must be a string";
++            return false;
++        }
++        p.down = kad_lower_trim(j["down"].get<std::string>());
++    }
++    if (p.down != "accepted" && p.down != "step") {
++        err = "unknown policy 'down' '" + p.down + "'";
++        return false;
++    }
++    auto get_int = [&](const char * name, int def, int minimum, int & dst) -> bool {
++        if (!j.contains(name)) {
++            dst = def;
++            return true;
++        }
++        const json & v = j[name];
++        if (v.is_boolean() || !v.is_number_integer()) {
++            err = std::string("the policy field '") + name + "' must be an integer";
++            return false;
++        }
++        long long x = v.is_number_unsigned() ? (long long) std::min<unsigned long long>(v.get<unsigned long long>(), INT_MAX)
++                                             : v.get<long long>();
++        x = std::min<long long>(x, INT_MAX);
++        dst = (int) std::max<long long>(minimum, x);
++        return true;
++    };
++    if (!get_int("fixed", 5, 1, p.fixed) || !get_int("base", 5, 1, p.base) || !get_int("kmin", 5, 1, p.kmin) ||
++        !get_int("kmax", 12, 1, p.kmax) || !get_int("up_after", 1, 1, p.up_after) || !get_int("up_step", 2, 0, p.up_step) ||
++        !get_int("down_slack", 1, 0, p.down_slack) || !get_int("down_step", 2, 0, p.down_step) ||
++        !get_int("hot_k", 12, 1, p.hot_k) || !get_int("hot_ttl", 8, 0, p.hot_ttl)) {
++        return false;
++    }
++    if (p.kmin > p.kmax) {
++        p.kmin = p.kmax;
++    }
++    p.base = std::max(p.kmin, std::min(p.base, p.kmax));
++    out = p;
++    return true;
++}
++
++void common_kad_ladder_update(common_kad_state & st, int v, int a, const common_kad_policy & pol) {
++    if (v <= 0) {
++        return;
++    }
++    int cur = st.cur;
++    if (a >= v) {
++        st.streak += 1;
++        if (st.streak >= pol.up_after) {
++            cur = std::min(cur + pol.up_step, pol.kmax);
++            st.streak = 0;
++        }
++    } else {
++        st.streak = 0;
++        if (pol.down == "accepted") {
++            cur = std::max(pol.kmin, std::min(cur, a + pol.down_slack));
++        } else {
++            cur = std::max(pol.kmin, cur - pol.down_step);
++        }
++    }
++    st.cur = std::max(pol.kmin, std::min(cur, pol.kmax));
++}
++
++int common_kad_decide(const common_kad_state * st, const common_kad_policy & pol, int64_t step, int kmax_run) {
++    if (pol.mode == "off") {
++        return std::max(1, kmax_run);
++    }
++    if (pol.mode == "fixed") {
++        return std::max(1, std::min(pol.fixed, kmax_run));
++    }
++    int cur = st ? st->cur : pol.base;
++    if (st && st->hot_until >= step) {
++        cur = std::max(cur, pol.hot_k);
++    }
++    const int hi = std::min(pol.kmax, kmax_run);
++    return std::max(1, std::min(cur, std::max(1, hi)));
++}
++
++// ------------------------------------------------------------------------------------------------ controller
++common_kad::common_kad(std::string base, std::string policy_file, int kmax_run)
++    : base_(std::move(base)), kmax_run_(std::max(1, kmax_run)) {
++    tag_ = "[yee-kad] " + base_;
++    std::string safe = base_;
++    for (auto & c : safe) {
++        if (!(std::isalnum((unsigned char) c) || c == '-' || c == '_' || c == '.')) {
++            c = '_';
++        }
++    }
++    policy_file_ = !policy_file.empty() ? policy_file : kad_env("YEE_KAD_POLICY", kad_dir() + "/kad_policy.json");
++    stats_file_  = kad_env("YEE_KAD_STATS_FILE", kad_dir() + "/kad_stats_" + safe + ".json");
++    log_s_       = kad_env_double("YEE_KAD_LOG_S", 30.0);
++    reload_s_    = kad_env_double("YEE_KAD_RELOAD_S", 1.0);
++    last_log_t_  = kad_now();
++    g_kad_instances.fetch_add(1);
++    if (kmax_run_ != 12) {
++        LOG_WRN("%s WARNING launch K=%d, KAD needs 12 (per-request width is capped at min(12, K))\n", tag_.c_str(), kmax_run_);
++    }
++    LOG_INF("%s enabled: launch K=%d, policy %s, stats %s\n", tag_.c_str(), kmax_run_, policy_file_.c_str(), stats_file_.c_str());
++    std::lock_guard<std::mutex> lock(mtx_);
++    reload_if_changed();
++}
++
++common_kad::~common_kad() {
++    g_kad_instances.fetch_sub(1);
++}
++
++void common_kad::error(const char * what, const std::string & msg) {
++    errors_ += 1;
++    if (err_printed_ < 5) {
++        err_printed_ += 1;
++        LOG_WRN("%s %s failed, the step keeps the native width: %s\n", tag_.c_str(), what, msg.c_str());
++    }
++}
++
++void common_kad::reload_if_changed() {
++    const double now = kad_now();
++    if (now - last_stat_t_ < reload_s_) {
++        return;
++    }
++    last_stat_t_ = now;
++    if (policy_file_.empty()) {
++        return;
++    }
++    std::error_code ec;
++    const auto mtime = std::filesystem::last_write_time(policy_file_, ec);
++    if (ec) {
++        return; // no file yet: keep the last valid policy
++    }
++    const auto size = std::filesystem::file_size(policy_file_, ec);
++    if (ec) {
++        return;
++    }
++    const int64_t m = (int64_t) mtime.time_since_epoch().count();
++    if (have_stamp_ && m == stamp_mtime_ && (int64_t) size == stamp_size_) {
++        return;
++    }
++    have_stamp_  = true;
++    stamp_mtime_ = m;
++    stamp_size_  = (int64_t) size;
++    std::ifstream f(policy_file_, std::ios::binary);
++    std::stringstream ss;
++    ss << f.rdbuf();
++    const std::string text = ss.str();
++    common_kad_policy p;
++    std::string err;
++    if (!common_kad_parse_policy(text, p, err)) {
++        error("policy load", err);
++        return;
++    }
++    policy_     = p;
++    policy_sha_ = common_kad_sha256_hex(text);
++    LOG_INF("%s policy loaded sha=%s mode=%s base=%d kmin=%d kmax=%d\n", tag_.c_str(), policy_sha_.substr(0, 12).c_str(),
++            p.mode.c_str(), p.base, p.kmin, p.kmax);
++    write_stats(snapshot_locked());
++}
++
++void common_kad::finish_step() {
++    if (cur_widths_.empty()) {
++        return;
++    }
++    steps_noted_ += 1;
++    const int first = cur_widths_.front();
++    for (int w : cur_widths_) {
++        w_hist_[w] += 1;
++    }
++    if (std::any_of(cur_widths_.begin(), cur_widths_.end(), [&](int w) { return w != first; })) {
++        mixed_ += 1;
++    }
++    cur_widths_.clear();
++}
++
++void common_kad::begin_step() {
++    std::lock_guard<std::mutex> lock(mtx_);
++    try {
++        finish_step();
++        step_ += 1;
++        reload_if_changed();
++        maybe_log(false);
++    } catch (const std::exception & e) {
++        error("step", e.what());
++    }
++}
++
++int common_kad::width(int slot, int n_cap, bool structured) {
++    if (n_cap <= 0) {
++        return n_cap;
++    }
++    std::lock_guard<std::mutex> lock(mtx_);
++    int k = kmax_run_;
++    try {
++        if (!structured) {
++            auto it = st_.find(slot);
++            k = common_kad_decide(it == st_.end() ? nullptr : &it->second, policy_, step_, kmax_run_);
++        }
++    } catch (const std::exception & e) {
++        error("width", e.what());
++        k = kmax_run_;
++    }
++    const int w = std::max(1, std::min(k, n_cap));
++    cur_widths_.push_back(w);
++    return structured ? n_cap : w;
++}
++
++void common_kad::observe(int slot, int v, int a) {
++    if (v <= 0) {
++        return;
++    }
++    a = std::max(0, std::min(a, v));
++    std::lock_guard<std::mutex> lock(mtx_);
++    if (policy_.mode == "ladder") {
++        auto it = st_.find(slot);
++        if (it == st_.end()) {
++            common_kad_state s;
++            s.cur = policy_.base;
++            it = st_.emplace(slot, s).first;
++        }
++        common_kad_ladder_update(it->second, v, a, policy_);
++    }
++    v_steps_ += 1;
++    sum_v_ += v;
++    sum_a_ += a;
++    auto & acc = acc_by_v_[v];
++    acc.first += 1;
++    acc.second += a;
++}
++
++void common_kad::release(int slot) {
++    std::lock_guard<std::mutex> lock(mtx_);
++    st_.erase(slot);
++}
++
++std::string common_kad::snapshot_locked() const {
++    json w = json::object();
++    for (const auto & kv : w_hist_) {
++        w[std::to_string(kv.first)] = kv.second;
++    }
++    json acc = json::object();
++    for (const auto & kv : acc_by_v_) {
++        acc[std::to_string(kv.first)] = json::array({ kv.second.first, kv.second.second });
++    }
++    json pol = {
++        { "mode", policy_.mode }, { "fixed", policy_.fixed }, { "base", policy_.base }, { "kmin", policy_.kmin },
++        { "kmax", policy_.kmax }, { "up_after", policy_.up_after }, { "up_step", policy_.up_step },
++        { "down", policy_.down }, { "down_slack", policy_.down_slack }, { "down_step", policy_.down_step },
++        { "hot_k", policy_.hot_k }, { "hot_ttl", policy_.hot_ttl },
++    };
++    json s = {
++        { "base", base_ }, { "enabled", true }, { "steps", steps_noted_ }, { "w_hist", w }, { "mixed_steps", mixed_ },
++        { "v_steps", v_steps_ }, { "sum_v", sum_v_ }, { "sum_a", sum_a_ }, { "acc_by_v", acc },
++        { "tracked", (int64_t) st_.size() }, { "errors", errors_ }, { "policy_sha256", policy_sha_ },
++        { "kmax_run", kmax_run_ }, { "policy", pol }, { "policy_file", policy_file_ },
++    };
++    return s.dump();
++}
++
++std::string common_kad::snapshot_json() {
++    std::lock_guard<std::mutex> lock(mtx_);
++    return snapshot_locked();
++}
++
++void common_kad::write_stats(const std::string & text) {
++    if (stats_file_.empty()) {
++        return;
++    }
++    try {
++        std::error_code ec;
++        const std::filesystem::path p(stats_file_);
++        if (p.has_parent_path()) {
++            std::filesystem::create_directories(p.parent_path(), ec);
++        }
++        const std::string tmp = stats_file_ + ".tmp";
++        {
++            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
++            f << text;
++        }
++        std::filesystem::rename(tmp, stats_file_, ec);
++        if (ec) {
++            error("stats", ec.message());
++        }
++    } catch (const std::exception & e) {
++        error("stats", e.what());
++    }
++}
++
++void common_kad::maybe_log(bool force) {
++    const double now = kad_now();
++    if (!force && (log_s_ <= 0 || now - last_log_t_ < log_s_)) {
++        return;
++    }
++    last_log_t_ = now;
++    std::string hist = "{";
++    for (const auto & kv : w_hist_) {
++        if (hist.size() > 1) {
++            hist += ",";
++        }
++        hist += std::to_string(kv.first) + ":" + std::to_string(kv.second);
++    }
++    hist += "}";
++    const double mean_v = v_steps_ ? (double) sum_v_ / v_steps_ : 0.0;
++    const double mean_a = v_steps_ ? (double) sum_a_ / v_steps_ : 0.0;
++    LOG_INF("%s steps=%lld mixed=%lld w_hist=%s mean_v=%.3f mean_a=%.3f tracked=%zu errors=%lld sha=%s\n", tag_.c_str(),
++            (long long) steps_noted_, (long long) mixed_, hist.c_str(), mean_v, mean_a, st_.size(), (long long) errors_,
++            policy_sha_.substr(0, 12).c_str());
++    write_stats(snapshot_locked());
++}
+diff --git a/common/kad.h b/common/kad.h
+new file mode 100644
+index 000000000..e8c1a9398
+--- /dev/null
++++ b/common/kad.h
+@@ -0,0 +1,107 @@
++#pragma once
++
++// Yee KAD for llama-server: per-request adaptive draft count (max 12).
++//
++// A server slot serves one request at a time, so there is one ladder state per slot, reset when the slot
++// starts a request. Each step the slot drafts min(KAD width, --spec-draft-n-max, context room) tokens and
++// the target verifies exactly those. Same policy JSON and rules as the vLLM / Python versions (yee.kad):
++//   off    : k = launch K
++//   fixed  : k = clamp(fixed, 1, launch K)
++//   ladder : start at base; all accepted -> +up_step (after up_after rounds) up to kmax;
++//            otherwise max(kmin, min(cur, accepted + down_slack)) ("accepted") or cur - down_step ("step").
++// The policy file is hot reloaded (mtime + size, at most once per second); an invalid file keeps the last
++// valid policy. Statistics: one log line every YEE_KAD_LOG_S seconds (default 30) and an atomically
++// written JSON file (YEE_KAD_STATS_FILE, default ~/.cache/yee/kad/kad_stats_llama.cpp.json).
++
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <string>
++#include <vector>
++
++struct common_kad_policy {
++    std::string mode       = "ladder";   // off | fixed | ladder (a policy file without "mode" means fixed)
++    int         fixed      = 5;
++    int         base       = 5;
++    int         kmin       = 5;
++    int         kmax       = 12;
++    int         up_after   = 1;
++    int         up_step    = 2;
++    std::string down       = "accepted"; // accepted | step
++    int         down_slack = 1;
++    int         down_step  = 2;
++    int         hot_k      = 12;
++    int         hot_ttl    = 8;
++};
++
++struct common_kad_state {
++    int     cur       = 5;
++    int     streak    = 0;
++    int64_t hot_until = -1;
++};
++
++// parse a policy JSON text with the rules of yee.kad.parse_policy; false (and err) when invalid
++bool common_kad_parse_policy(const std::string & text, common_kad_policy & out, std::string & err);
++void common_kad_ladder_update(common_kad_state & st, int v, int a, const common_kad_policy & pol);
++int  common_kad_decide(const common_kad_state * st, const common_kad_policy & pol, int64_t step, int kmax_run);
++std::string common_kad_sha256_hex(const std::string & data);
++
++// true while a KAD controller exists in this process: the drafters then stop at the per-slot cap
++bool common_kad_active();
++
++// YEE_KAD is 1 / true / yes / on (same switch as the Python bases; --kad / LLAMA_ARG_KAD also enable it)
++bool common_kad_env_enabled();
++
++class common_kad {
++public:
++    // policy_file / stats_file empty: $YEE_KAD_POLICY / $YEE_KAD_STATS_FILE, else ~/.cache/yee/kad/...
++    common_kad(std::string base, std::string policy_file, int kmax_run);
++    ~common_kad();
++
++    void begin_step();                                // once per server update loop
++    int  width(int slot, int n_cap, bool structured); // draft count of this step for one slot
++    void observe(int slot, int v, int a);             // v drafts verified, a accepted (bonus token excluded)
++    void release(int slot);                           // the slot starts or ends a request
++
++    std::string snapshot_json();
++    const std::string & policy_file() const { return policy_file_; }
++    int kmax_run() const { return kmax_run_; }
++
++private:
++    void reload_if_changed();
++    void maybe_log(bool force);
++    void write_stats(const std::string & json);
++    void error(const char * what, const std::string & msg);
++    void finish_step();
++    std::string snapshot_locked() const;
++
++    std::string base_;
++    std::string tag_;
++    std::string policy_file_;
++    std::string stats_file_;
++    int         kmax_run_;
++    double      log_s_;
++    double      reload_s_;
++
++    std::mutex mtx_;
++    common_kad_policy policy_;
++    std::string       policy_sha_;
++    bool              have_stamp_ = false;
++    int64_t           stamp_mtime_ = 0;
++    int64_t           stamp_size_  = -1;
++    double            last_stat_t_ = -1e30;
++    double            last_log_t_  = 0.0;
++
++    std::map<int, common_kad_state> st_;
++    int64_t step_        = 0;
++    int64_t steps_noted_ = 0;
++    int64_t mixed_       = 0;
++    int64_t v_steps_     = 0;
++    int64_t sum_v_       = 0;
++    int64_t sum_a_       = 0;
++    int64_t errors_      = 0;
++    int     err_printed_ = 0;
++    std::map<int, int64_t> w_hist_;
++    std::map<int, std::pair<int64_t, int64_t>> acc_by_v_;
++    std::vector<int> cur_widths_;
++};
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index e6290eaad..ec1937f87 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1,4 +1,5 @@
+ #include "speculative.h"
++#include "kad.h"
+ 
+ #include "common.h"
+ #include "ggml.h"
+@@ -884,7 +885,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+ 
+                 result.push_back(id);
+ 
+-                if (params.n_max <= (int) result.size()) {
++                if ((params.n_max <= (int) result.size()) ||
++                    (common_kad_active() && dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+@@ -1912,7 +1914,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                 }
+ 
+-                if (params.n_max <= (int) result.size()) {
++                if ((params.n_max <= (int) result.size()) ||
++                    (common_kad_active() && dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 48f1e93a2..7bddecf85 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -19,6 +19,7 @@
+ #include "log.h"
+ #include "sampling.h"
+ #include "speculative.h"
++#include "kad.h"
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
+ #include "base64.hpp"
+@@ -1091,6 +1092,7 @@ private:
+     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+ 
+     common_speculative_ptr spec;
++    std::unique_ptr<common_kad> kad; // Yee KAD (--kad / LLAMA_ARG_KAD / YEE_KAD=1), null when off
+ 
+     bool add_bos_token = true;
+ 
+@@ -1491,6 +1493,11 @@ private:
+         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+             try {
+                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
++
++                if (spec && (params_base.speculative.kad || common_kad_env_enabled())) {
++                    kad = std::make_unique<common_kad>("llama.cpp", params_base.speculative.kad_policy,
++                                                       common_speculative_n_max(spec.get()));
++                }
+             } catch (const std::exception & e) {
+                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+                 if (params_base.speculative.has_synth()) {
+@@ -3836,6 +3843,10 @@ private:
+         std::vector<server_slot *> generating;
+         std::vector<server_slot *> drafting;
+ 
++        if (kad) {
++            kad->begin_step();
++        }
++
+         // determine which slots are generating and drafting
+         iterate(slots, [&](server_slot & slot) {
+             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+@@ -3892,7 +3903,9 @@ private:
+ 
+                         common_speculative_get_draft_params(spec.get(), slot.id) = {
+                             /* .drafting = */ true,
+-                            /* .n_max    = */ n_draft_max,
++                            /* .n_max    = */ kad ? kad->width(slot.id, n_draft_max,
++                                                           slot.task->params.sampling.grammar.type != COMMON_GRAMMAR_TYPE_NONE)
++                                                : n_draft_max,
+                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
+                             /* .id_last  = */ slot.sampled,
+                             /* .prompt   = */ &slot.spec_prompt,
+@@ -4857,6 +4870,9 @@ private:
+                 slot.state = SLOT_STATE_GENERATING;
+ 
+                 if (slot.can_speculate()) {
++                    if (kad) {
++                        kad->release(slot.id);
++                    }
+                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                 }
+             } else if (slot.state != SLOT_STATE_GENERATING) {
+@@ -4971,6 +4987,10 @@ private:
+                         }
+ 
+                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
++                        if (kad) {
++                            kad->observe(slot.id, (int) n_draft, (int) accepted.size() - 1);
++                        }
++
+                         slot.spec_is_replay = true;
+                         slot.spec_draft = std::move(accepted);
+ 
+@@ -4997,6 +5017,10 @@ private:
+                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
+                 }
+ 
++                if (kad && !slot.spec_is_replay) {
++                    kad->observe(slot.id, (int) n_draft, (int) accepted.size() - 1);
++                }
++
+                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+ 
+                 slot.spec_draft = std::move(accepted);

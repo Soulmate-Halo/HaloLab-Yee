@@ -71,3 +71,12 @@ yee bench --url http://127.0.0.1:8000 --model <served-model-name> --rounds 2
 ```
 
 `bench` 要求 `replies identical: True`，且第 2 次比第 1 次快。
+
+## 8. 生产适配器 vllm_d_recall 与 KAD（3.1.0）
+
+生产 vLLM 服务（DSpark 草稿头）用的是另一个适配器 `vllm_d_recall`，不是上面的 `vllm_spec`。它原来有独立的版本线（1.0.0 线上 → 1.1.0 HK → 1.2.0 KAD），3.0.0 起随 Yee 一起发，版本号也是 3.0.0，包在同一个 wheel 里。
+
+- 开关和记录目录沿用原来的 `VLLM_D_RECALL_*` 变量，名字不变。
+- 3.0.0 带 KAD：以 `num_speculative_tokens = 12` 启动一次，之后每个请求按自己的接受情况在 5～12 之间选块宽，策略文件热加载。
+- 3.1.0 起，KAD 覆盖 vLLM 的全部草稿头（不只 DSpark）：dspark、eagle、eagle3、mtp、draft_model、dflash、多模块 MTP 等都用同一套逐请求自适应草稿数，`K_max` 统一为 12；原理、默认 ladder 策略、统计与回退不变，各头的草稿侧路径见 [kad.md](kad.md)。
+- 怎么开、策略格式、统计和回退见 [kad.md](kad.md)（`yee doc kad`）。

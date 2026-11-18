@@ -79,3 +79,48 @@ GSM8K 每档 16 道新题、串行、max_tokens 512，同批题第 1 遍 / 第 2
 4. 或把 `MLX_SERVE_D_RECALL=0`，关掉召回功能但保留补丁。
 
 通用回退方法见 [patches.md](patches.md)。
+
+## 8. Yee 2.4 冷层（补丁 `mlx-serve-2.4`，3.0.0 起入包）
+
+在召回记录之外加一层落盘的冷层，重启后记录还在。
+
+- 冷层是 NVMe 上的 `tokens.bin` + `index.bin`，由一个后台线程写入。
+- 每轮 DSpark 预查下一轮最多 3 个分支的冷层命中，推理线程只做非阻塞读。
+- 基线是 M5 上已经带 Yee 2.3 的线上源码（r608 src_base，线上二进制 sha16 `1ff9c2a5df3f1829`），不是第 1 节的 r593 原版。
+
+替换 / 新增 4 个文件：
+
+```
+src/engines/mlx/spec/d_recall.zig
+src/engines/mlx/spec/d_recall_live.zig
+src/engines/mlx/spec/d_recall_cold.zig    # 新文件
+src/env.zig
+```
+
+```bash
+yee patch show mlx-serve-2.4
+yee patch apply mlx-serve-2.4 --src <源码根> --check
+yee patch apply mlx-serve-2.4 --src <源码根>
+zig build check
+zig build test -Dtest-filter=d_recall     # 113/113（含 5 个 cold 测试）
+zig build test -Dtest-filter=dspark       # 73/73
+zig build -Doptimize=ReleaseFast
+```
+
+环境变量（在 `env.zig` 里登记）：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `MLX_SERVE_D_RECALL_COLD_DIR` | 不设 | 冷层目录；不设或为空 = 关闭，不起线程、不建文件，行为与 2.3 相同 |
+| `MLX_SERVE_D_RECALL_COLD_SLOTS` | `268435456` | 新建冷层索引的哈希槽数（每槽 16 字节，稀疏文件；已有索引沿用自己的） |
+| `MLX_SERVE_D_RECALL_COLD_GB` | `64` | 冷层文件上限（GB），超过后只读不写 |
+| `MLX_SERVE_D_RECALL_PREFETCH` | `3` | 每轮预查的下一轮分支数（钳在 0..3） |
+
+M5 实测（r608，2.3 与 2.4 交替 6 段，构建产物 `mlx-serve.r608-v24`，sha16 `530781ec80c411bb`，版本 `26.11.1-xypd-v24`）：
+
+- 聚合 decode 成对差值 +0.0377% / −0.4114% / −1.0819%，平均 −0.4852%。
+- 命中率（offers/lookups）+4.79 / +10.13 / +4.36 个百分点。
+- 请求错误 0，`cold_ioerr` 全为 0，新增 panic 0。
+- 测完线上已恢复 2.3（sha16 `1ff9c2a5df3f1829`）；2.4 没有在 M5 上常驻上线。
+
+回退：去掉 `MLX_SERVE_D_RECALL_COLD_DIR` 重启即回到 2.3 行为；要还原源码，从 `.yee-backup-<时间戳>/` 拷回原文件、删掉 `d_recall_cold.zig`，重新编译。

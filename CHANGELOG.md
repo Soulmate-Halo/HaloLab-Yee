@@ -1,7 +1,18 @@
 # 变更记录
 
-本文件按版本倒序记录模块的变更。仓库首发版本为 sglang-d-recall 1.2.0（tag `v1.2.0`），2.2.0 起发行包改名为 `yee`。
+本文件按版本倒序记录模块的变更。仓库首发版本为 sglang-d-recall 1.2.0（tag `v1.2.0`），2.2.0 起发行包改名为 `yee`，当前版本 4.2.0（tag `v4.2.0`）。
 
+## 4.2.0（Yee）
+
+所有加速开关默认打开，不依赖启动参数，新增一键安装。2.3.0～4.1.1 各版本的详细变化见 `yee/docs/changelog.md`（`yee doc changelog`）。
+
+- 默认打开：召回（`RECALL_ACCEL`，采样请求也用）、KAD（`YEE_KAD`）、热专家验证预算（`YEE_EXPERT_BUDGET`，`_P=0.9`）、vLLM 的 `VLLM_D_RECALL` / `_NONGREEDY` / `_KAD`、逐请求 conf（vcap，`{"mode": "adapt"}`）。召回容量默认 0.25 GiB、索引密度 1。显式设 0 可单独关闭，`YEE=0` 整体不加载。
+- 不改启动参数：块长、并发、EP、MoE 后端按原配置运行；SGLang Mia DSV41 镜像里从 `--speculative-dspark-block-size` 读块长，只给没设的变量补配套值。
+- 新增跨 rank 版本一致性检查：各 TP rank 都装了同版本 Yee 才启用召回广播和专家预算，否则所有 rank 一起关闭并打印 `rank check off`，服务照常运行。
+- 新增 `python -m yee config`：打印每个开关的生效值与来源。
+- 新增一键安装 `install/install.sh`：MiaAI dsv41-4x-spark 自动找方案目录、多台机器都装、`--check` / `--restart` / `--uninstall`，失败自动回退；其它机器走 `pip install` + `yee install-hook`。
+- 支持范围：SGLang（DSPARK/DFLASH/EAGLE/EAGLE3/NEXTN/MTP/STANDALONE/UNO/NGRAM）、vLLM V2（dspark/dflash/eagle/eagle3/mtp）、llama.cpp、TensorRT-LLM、LMDeploy、mlx-lm、transformers、TensorFold、cuteafd、mlx-serve、strata。
+- wheel：`dist/yee-4.2.0-py3-none-any.whl`，sha256 `f6d1e0fde883b60b8d05bbab413bb40c7f8ca3bc155795723ea4ddb7444c6005`。
 ## 2.2.0（Yee）
 
 recall-accel 2.1.0 改名为 Yee，并扩展到多个推理框架。详细说明见 `yee doc changelog`（源文件 `yee/docs/changelog.md`）。

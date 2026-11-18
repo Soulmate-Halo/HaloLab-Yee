@@ -79,6 +79,13 @@ _P15 = pow(_P, WINDOW - 1, 1 << 64)
 _M1 = 0xBF58476D1CE4E5B9
 _CHUNK_RE = re.compile(r"^chunk-(\d{8})\.ids$")
 _TRUE = ("1", "true", "yes", "on")
+# shared disk record (3.6.0): how long a process waits for the directory lock, in seconds. When opening times out,
+# another process holds the lock for good (a 3.5.x writer, or shared off) and this one falls back to the old
+# read-only behaviour; an append or a refresh that cannot get the lock in time is skipped and counted.
+SHARED_LOCK_WAIT = 10.0
+SHARED_ADD_WAIT = 5.0
+SHARED_REFRESH_WAIT = 0.5
+GEN_FILE = "generation"  # rewritten by every clear of a shared record: the other processes then read it again
 BACKENDS = ("disk", "memory", "cuda")
 DEFAULT_DEVICE = "cuda:0"
 # index density: how many hash slots one stored id gets. The 16-gram index is a direct-mapped hash table
@@ -110,6 +117,8 @@ ENV_NEW = {
     "heat_seen_weight": "RECALL_ACCEL_HEAT_SEEN_WEIGHT",
     "promote_tokens": "RECALL_ACCEL_PROMOTE_TOKENS",
     "index_density": "RECALL_ACCEL_INDEX_DENSITY",
+    "shared": "RECALL_ACCEL_SHARED",
+    "qhash": "RECALL_ACCEL_QHASH",
 }
 ENV_OLD = {
     "on": "SGLANG_D_RECALL",
@@ -131,6 +140,8 @@ ENV_OLD = {
     "heat_seen_weight": "SGLANG_D_RECALL_HEAT_SEEN_WEIGHT",
     "promote_tokens": "SGLANG_D_RECALL_PROMOTE_TOKENS",
     "index_density": "SGLANG_D_RECALL_INDEX_DENSITY",
+    "shared": "SGLANG_D_RECALL_SHARED",
+    "qhash": "SGLANG_D_RECALL_QHASH",
 }
 ENV_OLDER = {
     "on": "DSV41_RECALL",
@@ -152,6 +163,8 @@ ENV_OLDER = {
     "heat_seen_weight": "RECALL_HEAT_SEEN_WEIGHT",
     "promote_tokens": "RECALL_PROMOTE_TOKENS",
     "index_density": "RECALL_INDEX_DENSITY",
+    "shared": "DSV41_RECALL_SHARED",
+    "qhash": "DSV41_RECALL_QHASH",
 }
 
 
@@ -360,22 +373,45 @@ class _DiskStore(_Store):
     backend = "disk"
 
     def __init__(self, directory: str, identity: Optional[dict] = None, read_only: bool = False,
-                 min_free_bytes: float = 0.0, cap_ids: int = CHUNK_IDS, chunk_ids: int = CHUNK_IDS) -> None:
+                 min_free_bytes: float = 0.0, cap_ids: int = CHUNK_IDS, chunk_ids: int = CHUNK_IDS,
+                 shared: bool = False) -> None:
         super().__init__(cap_ids, chunk_ids)
         self.dir = os.path.abspath(os.path.expanduser(str(directory)))
         self.identity = dict(identity or {})
         self.identity_on_disk: dict = {}
         self.read_only = bool(read_only)
         self.writer = False
+        # shared (3.6.0): every process appends under a short exclusive flock and takes in what the others
+        # appended under a shared one. Without fcntl, or read-only, the record stays as in 3.5.x.
+        self.shared = bool(shared) and fcntl is not None and not self.read_only
         self.min_free_bytes = float(min_free_bytes)
         self.last_error = ""
         self._lock_fh = None
+        self._locked = False
         self._fh = None
         self._fh_seq = -1
+        self._gen = ""
         self.load_evicted = 0
+        self.synced_ids = 0
+        self.resets = 0
+        self.lock_timeouts = 0
         self._chunks: Dict[int, np.ndarray] = {}
         self._fill: Dict[int, int] = {}
         self._open_dir()
+        if self.shared and self.lock(False, SHARED_LOCK_WAIT):
+            try:
+                self._gen = self._read_gen()
+                self._load(cleanup=False)
+            finally:
+                self.unlock()
+            return
+        if self.shared:
+            # another process holds the lock for good (a 3.5.x writer, or RECALL_ACCEL_SHARED=0 there): behave
+            # like a 3.5.x second process (read-only) instead of waiting at every append
+            self.shared = False
+            self.writer = False
+            self.last_error = ("shared record %s: another process keeps the lock (3.5.x or shared off); "
+                               "read-only here" % self.dir)
         self._load()
 
     # -- setup -------------------------------------------------------------------------------------
@@ -423,6 +459,11 @@ class _DiskStore(_Store):
             self._lock_fh = fh
             self.writer = True
             return
+        if self.shared:
+            # no lasting lock: each append and each refresh takes it for a moment (lock / unlock)
+            self._lock_fh = fh
+            self.writer = True
+            return
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -432,7 +473,12 @@ class _DiskStore(_Store):
         self._lock_fh = fh
         self.writer = True
 
-    def _load(self) -> None:
+    def _load(self, cleanup: Optional[bool] = None) -> None:
+        """Read the newest contiguous run of chunk files. ``cleanup`` (default: this process is the writer) also
+        deletes older chunks, cuts a torn last id and evicts beyond the cap. A shared record loads without it,
+        since other processes may be appending; sync() cuts a torn id under the exclusive lock instead."""
+        if cleanup is None:
+            cleanup = self.writer
         if not os.path.isdir(self.dir):
             return
         seqs = sorted(int(m.group(1)) for m in (_CHUNK_RE.match(n) for n in os.listdir(self.dir)) if m)
@@ -443,7 +489,7 @@ class _DiskStore(_Store):
             if s != run[0] - 1:
                 break
             run.insert(0, s)
-        if self.writer:
+        if cleanup:
             for s in seqs:
                 if s < run[0]:
                     try:
@@ -456,7 +502,7 @@ class _DiskStore(_Store):
             with open(path, "rb") as f:
                 data = f.read()
             usable = len(data) // 4 * 4
-            if usable != len(data) and self.writer:
+            if usable != len(data) and cleanup:
                 os.truncate(path, usable)
             arr = np.frombuffer(data[:usable], dtype="<i4")[:C]
             buf = np.full(C, SENTINEL, dtype=np.int32)
@@ -466,11 +512,123 @@ class _DiskStore(_Store):
         last = run[-1]
         self.base_pos = run[0] * C
         self.end_pos = last * C + self._fill[last]
-        if self.writer:
+        if cleanup:
             self.load_evicted = self.evict()
         for s in sorted(self._chunks):
             g0 = s * C
             self._ranges.append((g0, g0 + self._fill[s] if s == last else g0 + C))
+
+    # -- shared record (3.6.0) ---------------------------------------------------------------------
+    def lock(self, exclusive: bool, wait: float) -> bool:
+        """Take the directory lock for one append (exclusive) or one refresh (shared); True when the record is
+        not shared (nothing to take). Gives up after ``wait`` seconds."""
+        if not self.shared or self._lock_fh is None:
+            return True
+        op = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
+        t_end = time.monotonic() + max(0.0, float(wait))
+        while True:
+            try:
+                fcntl.flock(self._lock_fh.fileno(), op)
+                self._locked = True
+                return True
+            except OSError:
+                if time.monotonic() >= t_end:
+                    self.lock_timeouts += 1
+                    return False
+                time.sleep(0.002)
+
+    def unlock(self) -> None:
+        if self._locked and self._lock_fh is not None:
+            try:
+                fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        self._locked = False
+
+    def _read_gen(self) -> str:
+        try:
+            with open(os.path.join(self.dir, GEN_FILE), "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    def _write_gen(self) -> None:
+        gen = "%d-%d" % (time.time_ns(), os.getpid())
+        tmp = os.path.join(self.dir, ".%s.tmp" % GEN_FILE)
+        _write_private(tmp, gen + "\n")
+        os.replace(tmp, os.path.join(self.dir, GEN_FILE))
+        self._gen = gen
+
+    def _reset_memory(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+            self._fh_seq = -1
+        self.base_pos = 0
+        self.end_pos = 0
+        self._chunks.clear()
+        self._fill.clear()
+        self._ranges = []
+
+    def sync(self, exclusive: bool) -> Tuple[List[Tuple[int, int]], bool]:
+        """Shared record, lock held: take in the ids the other processes appended since the last sync.
+
+        Returns (ranges to index, reset). reset: another process cleared the record, which was read again from
+        the disk (every range is new). Under the exclusive lock a torn last id (a process that died in the middle
+        of an append) is cut first, so the next append starts right after the last whole id."""
+        if not self.shared:
+            return [], False
+        gen = self._read_gen()
+        if gen != self._gen:
+            self._reset_memory()
+            self._gen = gen
+            self._load(cleanup=False)
+            self.resets += 1
+            ranges, self._ranges = self._ranges, []
+            self.synced_ids += sum(g1 - g0 for g0, g1 in ranges)
+            return ranges, True
+        C = self.chunk_ids
+        new: List[Tuple[int, int]] = []
+        while True:
+            seq = self.end_pos // C
+            o = self.end_pos - seq * C
+            path = self._chunk_path(seq)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                # not there: nothing appended yet, or the others evicted it before this process saw it
+                later = [int(m.group(1)) for m in (_CHUNK_RE.match(n) for n in os.listdir(self.dir)) if m]
+                later = [s for s in later if s > seq]
+                if not later:
+                    break
+                self.end_pos = min(later) * C  # the ids in between are gone
+                continue
+            if size % 4 and exclusive:
+                os.truncate(path, size - size % 4)
+                size -= size % 4
+            have = o * 4
+            if size <= have:
+                break
+            with open(path, "rb") as f:
+                f.seek(have)
+                data = f.read(min(size, C * 4) - have)
+            arr = np.frombuffer(data[:len(data) // 4 * 4], dtype="<i4")
+            if arr.size == 0:
+                break
+            if seq not in self._chunks:
+                self._chunks[seq] = np.full(C, SENTINEL, dtype=np.int32)
+            self._chunks[seq][o:o + arr.size] = arr
+            self._fill[seq] = o + int(arr.size)
+            g0 = self.end_pos
+            self.end_pos = g0 + int(arr.size)  # committed only after the ids are in memory
+            new.append((g0, self.end_pos))
+            self.synced_ids += int(arr.size)
+            if self._fill[seq] < C:
+                break
+        return new, False
 
     # -- low level ---------------------------------------------------------------------------------
     def read(self, g0: int, g1: int) -> Optional[np.ndarray]:
@@ -530,7 +688,7 @@ class _DiskStore(_Store):
             self.end_pos += take  # committed only after the ids are in memory
             off += take
 
-    def evict(self) -> int:
+    def evict(self, remove_files: bool = True) -> int:
         C = self.chunk_ids
         evicted = 0
         while self.end_pos - self.base_pos > self.cap_ids and len(self._chunks) > 1:
@@ -539,6 +697,9 @@ class _DiskStore(_Store):
             self._chunks.pop(oldest, None)
             self._fill.pop(oldest, None)
             self._drop_range(oldest)
+            if not remove_files:  # a shared record under the shared lock: only this process's copy goes
+                evicted += 1
+                continue
             try:
                 os.remove(self._chunk_path(oldest))
             except FileNotFoundError:
@@ -568,6 +729,8 @@ class _DiskStore(_Store):
                     os.remove(os.path.join(self.dir, name))
                 except OSError:
                     failed.append(os.path.join(self.dir, name))
+        if self.shared and not failed:
+            self._write_gen()  # the other processes start over at their next sync
         return failed
 
     def restore(self, ids: np.ndarray, base_pos: int) -> None:
@@ -837,7 +1000,8 @@ class RecallRecord:
                  backend: str = "disk", device: Optional[str] = None, evict: Optional[str] = None,
                  hot_frac: Optional[float] = None, dedup_run: Optional[int] = None,
                  heat_halflife_ids: Optional[float] = None, heat_seen_weight: Optional[float] = None,
-                 promote_tokens: Optional[float] = None, index_density: Optional[float] = None, environ=None):
+                 promote_tokens: Optional[float] = None, index_density: Optional[float] = None, environ=None,
+                 shared: Optional[bool] = None):
         backend = str(backend or "disk").strip().lower()
         if backend in ("gpu", "cuda"):
             backend = "cuda"
@@ -873,6 +1037,13 @@ class RecallRecord:
                                                         float(_cfg(index_density, "index_density",
                                                                    DEFAULT_INDEX_DENSITY))))
         self.min_free_bytes = float(min_free_gib) * (1 << 30)
+        # shared disk record (3.6.0, default on): every process sharing the directory appends and sees the others;
+        # off (RECALL_ACCEL_SHARED=0 / shared=False) is the 3.5.x single writer
+        if shared is None:
+            shared = str(_cfg(None, "shared", "1")).strip().lower() in _TRUE
+        self._shared_req = bool(shared)
+        self.shared = False
+        self.synced = 0
         self.identity = dict(identity or {})
         self.identity_on_disk: dict = {}
         self.read_only = bool(read_only)
@@ -910,6 +1081,9 @@ class RecallRecord:
             except OSError:
                 self.dir = None
         self.writer = bool(getattr(self.store, "writer", True))
+        self.shared = bool(getattr(self.store, "shared", False))
+        if getattr(self.store, "last_error", ""):
+            self.last_error = str(self.store.last_error)
         self.identity_on_disk = dict(getattr(self.store, "identity_on_disk", {}))
         self.evicted_chunks += int(getattr(self.store, "load_evicted", 0))
         for g0, g1 in self.store.index_ranges():
@@ -922,7 +1096,7 @@ class RecallRecord:
                 raise ValueError("the disk backend needs a directory")
             return _DiskStore(directory, self.identity, read_only=self.read_only,
                               min_free_bytes=self.min_free_bytes, cap_ids=self.cold_cap_ids,
-                              chunk_ids=self.chunk_ids)
+                              chunk_ids=self.chunk_ids, shared=self._shared_req)
         if self.backend == "memory":
             return _MemoryStore(cap_ids=self.cold_cap_ids, chunk_ids=self.chunk_ids)
         return _CudaStore(cap_ids=self.cold_cap_ids, chunk_ids=self.chunk_ids, device=device or DEFAULT_DEVICE)
@@ -1338,6 +1512,19 @@ class RecallRecord:
                     return 0
             except OSError:
                 pass
+        if self.shared:
+            with self._wlock:
+                if not self.store.lock(True, SHARED_ADD_WAIT):
+                    return 0
+                try:
+                    self._absorb(*self.store.sync(True), exclusive=True)
+                    return self._add_locked(a)
+                finally:
+                    self.store.unlock()
+        return self._add_locked(a)
+
+    def _add_locked(self, a: np.ndarray) -> int:
+        """The append itself; a shared record holds the exclusive directory lock around it."""
         with self._wlock:
             seen: Optional[list] = None
             if self._heat_on:
@@ -1359,6 +1546,41 @@ class RecallRecord:
             self.adds += 1
             return added
 
+    def _absorb(self, ranges, reset: bool, exclusive: bool) -> int:
+        """Index what sync() took in from the other processes; a reset (cleared elsewhere) drops this process's
+        index first. Evicts beyond the cap: files too under the exclusive lock, only this copy otherwise."""
+        if reset:
+            self._keys[:] = 0
+            self._pos[:] = -1
+            for _w, sk, sp in getattr(self, "_short", ()):  # vllm_d_recall.core has no short-window index
+                sk[:] = 0
+                sp[:] = -1
+            self._init_heat()
+        n = 0
+        for g0, g1 in ranges:
+            self._index_range(g0, g1)
+            n += g1 - g0
+        if n or reset:
+            ev = int(self.store.evict(remove_files=exclusive))
+            self.evicted_chunks += ev
+            if ev or reset:
+                self._purge_index()
+        self.synced += n
+        return n
+
+    def refresh(self) -> int:
+        """Shared disk record: take in what the other processes appended; returns how many ids came in.
+        RecallEngine.tick() calls it every 2 s (from the background thread when there is one)."""
+        if not self.shared:
+            return 0
+        with self._wlock:
+            if not self.store.lock(False, SHARED_REFRESH_WAIT):
+                return 0
+            try:
+                return self._absorb(*self.store.sync(False), exclusive=False)
+            finally:
+                self.store.unlock()
+
     def lookup(self, tail, max_back: int = MAX_BACK, h: Optional[int] = None) -> Optional[Tuple[int, int]]:
         """(continuation position, match length) for the newest occurrence of tail's last 16 ids, else of its
         last 8, else of its last 4 (SHORT_WINDOWS; a short hit's match length may be below 16)."""
@@ -1367,6 +1589,48 @@ class RecallRecord:
         if r is None and self._short:
             r = self._short_lookup(t, max_back)
         return r
+
+    def lookup_all(self, tail, max_back: int = MAX_BACK, h: Optional[int] = None) -> List[Tuple[int, int]]:
+        """Every distinct (continuation position, match length) :meth:`lookup` could answer from, best first: the
+        hot zone's and the cold ring's 16-id hits, then each short window's (tree rounds, 2.3.0). No counter moves."""
+        t = np.asarray(tail, dtype=np.int64)
+        out: List[Tuple[int, int]] = []
+
+        def add(r):
+            if r is not None and all(r[0] != o[0] for o in out):
+                out.append((int(r[0]), int(r[1])))
+
+        if t.size >= WINDOW:
+            hh = _hash_window_int(t[-WINDOW:].tolist()) if h is None else h
+            if self._hot_n and self.hot_ids:
+                add(self._hot_lookup(t, hh, max_back))
+            add(self._cold_lookup(t, max_back, hh))
+        if self._short and self.end_pos - self.base_pos >= WINDOW:
+            for w, sk, sp in self._short:
+                if t.size < w:
+                    continue
+                hw = _hash_window_int(t[-w:].tolist())
+                s = _mix_int(hw) & self._smask
+                if int(sk[s]) != hw:
+                    continue
+                p = int(sp[s])
+                if p - w < self.base_pos or p > self.end_pos:
+                    continue
+                rec = self._read(p - w, p)
+                if rec is None or not np.array_equal(rec, t[-w:]):
+                    continue
+                L = w
+                lim = min(int(max_back), int(t.size))
+                if lim > w:
+                    g0 = max(self.base_pos, p - lim)
+                    back = self._read(g0, p - w)
+                    if back is not None and back.size:
+                        tb = t[t.size - w - back.size:t.size - w]
+                        mm = np.flatnonzero(back[::-1] != tb[::-1])
+                        L += int(mm[0]) if mm.size else int(back.size)
+                add((p, L))
+        out.sort(key=lambda r: -r[1])
+        return out
 
     def _short_lookup(self, t: np.ndarray, max_back: int) -> Optional[Tuple[int, int]]:
         if self.end_pos - self.base_pos < WINDOW:
@@ -1467,7 +1731,13 @@ class RecallRecord:
         if not self.writer:
             raise PermissionError("recall record %s is read-only here" % (self.dir or self.backend))
         with self._wlock:
-            failed = self.store.clear()
+            if self.shared and not self.store.lock(True, SHARED_LOCK_WAIT):
+                raise OSError("recall record %s: the directory lock stayed busy, not cleared" % self.dir)
+            try:
+                failed = self.store.clear()
+            finally:
+                if self.shared:
+                    self.store.unlock()
             self._keys[:] = 0
             self._pos[:] = -1
             for _w, sk, sp in self._short:
@@ -1511,6 +1781,10 @@ class RecallRecord:
             "backend": self.backend,
             "state": self.state,
             "writer": self.writer,
+            "shared": bool(self.shared),
+            "synced_ids": int(getattr(self.store, "synced_ids", 0)),
+            "shared_resets": int(getattr(self.store, "resets", 0)),
+            "lock_timeouts": int(getattr(self.store, "lock_timeouts", 0)),
             "ids": int(self.end_pos - self.base_pos),
             "chunks": int(self.store.chunk_count()),
             "bytes_disk": self.disk_bytes(),
@@ -1648,6 +1922,154 @@ class RecallRecord:
 
 
 # ----------------------------------------------------------------------------------------------- engine
+# ----------------------------------------------------------------------------------------------- question hash
+# Question-hash index (qhash): the reply to a prompt is filed under hashes of that prompt (the whole prompt and its
+# last 512 / 128 / 32 ids, so a prompt that differs only near its head - a date, a session id in the system part -
+# still finds it). A new stream whose prompt hashes to a filed reply drafts from that reply from its first token,
+# and after a divergence lines up again inside that one reply on QHASH_GRAM ids. The target verifies every id.
+QHASH_LEVELS = (0, 512, 128, 32)  # 0: the whole prompt
+QHASH_GRAM = 4
+QHASH_MIN_ANS = 8
+QHASH_MAX_ANS = 16384
+QHASH_CAP = 8192  # key files (disk) / keys (memory)
+QHASH_START_L = 64  # the match length a prompt-hash hit is ranked as
+
+
+def _qhash_keys(prompt) -> List[str]:
+    p = np.ascontiguousarray(np.asarray(prompt, dtype="<i8").ravel())
+    keys = []
+    for k in QHASH_LEVELS:
+        if k and p.size <= k:
+            continue
+        part = p if k == 0 else p[-k:]
+        h = hashlib.blake2b(part.tobytes(), digest_size=12, person=("yeeq%d" % k).encode("ascii"))
+        keys.append("%d-%s" % (k, h.hexdigest()))
+    return keys
+
+
+class _QStore:
+    """key -> reply ids. With a directory: one file per key under <dir>/qhash (atomic replace, read on every get,
+    so every process sharing the directory sees it and it survives a restart); else an in-process dict."""
+
+    def __init__(self, directory: Optional[str], read_only: bool = False, cap: int = QHASH_CAP) -> None:
+        self.cap = max(4, int(cap))
+        self.read_only = bool(read_only)
+        self.dir: Optional[str] = None
+        self._mem: Dict[str, np.ndarray] = {}
+        self._lock = threading.Lock()
+        self.puts = 0
+        self._n = 0
+        if directory:
+            d = os.path.join(str(directory), "qhash")
+            try:
+                if not self.read_only:
+                    os.makedirs(d, mode=0o700, exist_ok=True)
+                if os.path.isdir(d):
+                    self.dir = d
+                    self._n = sum(1 for n in os.listdir(d) if n.endswith(".i4"))
+            except OSError:
+                self.dir = None
+
+    def get(self, keys) -> Optional[np.ndarray]:
+        for k in keys:
+            if self.dir is None:
+                a = self._mem.get(k)
+            else:
+                try:
+                    with open(os.path.join(self.dir, k + ".i4"), "rb") as f:
+                        data = f.read()
+                except OSError:
+                    continue
+                a = np.frombuffer(data[:len(data) // 4 * 4], dtype="<i4")
+            if a is not None and a.size >= QHASH_MIN_ANS:
+                return a.astype(np.int64)
+        return None
+
+    def put(self, keys, out) -> int:
+        if self.read_only:
+            return 0
+        a = np.asarray(out, dtype=np.int64).ravel()[:QHASH_MAX_ANS]
+        if a.size < QHASH_MIN_ANS or int(a.min()) < 0 or int(a.max()) > 0x7FFFFFFF:
+            return 0
+        a32 = a.astype("<i4")
+        with self._lock:
+            self.puts += 1
+            if self.dir is None:
+                for k in keys:
+                    self._mem.pop(k, None)
+                    self._mem[k] = a32
+                while len(self._mem) > self.cap:
+                    self._mem.pop(next(iter(self._mem)))
+                return int(a32.size)
+            data = a32.tobytes()
+            for k in keys:
+                path = os.path.join(self.dir, k + ".i4")
+                tmp = os.path.join(self.dir, ".%s.%d.tmp" % (k, os.getpid()))
+                try:
+                    new = not os.path.exists(path)
+                    with open(tmp, "wb") as f:
+                        f.write(data)
+                    os.replace(tmp, path)
+                    if new:
+                        self._n += 1
+                except OSError:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+            if self._n > self.cap or self.puts % 64 == 0:
+                self._trim()
+        return int(a32.size)
+
+    def _trim(self) -> None:
+        """Keep the newest ``cap`` key files (by mtime); drop stale temp files."""
+        try:
+            names = os.listdir(self.dir)
+        except OSError:
+            return
+        now = time.time()
+        files = []
+        for n in names:
+            p = os.path.join(self.dir, n)
+            try:
+                m = os.path.getmtime(p)
+            except OSError:
+                continue
+            if n.endswith(".i4"):
+                files.append((m, p))
+            elif n.endswith(".tmp") and now - m > 60.0:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        files.sort()
+        drop = len(files) - self.cap
+        for _m, p in files[:max(0, drop)]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        self._n = len(files) - max(0, drop)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._mem.clear()
+            if self.dir is not None:
+                try:
+                    for n in os.listdir(self.dir):
+                        if n.endswith(".i4") or n.endswith(".tmp"):
+                            try:
+                                os.remove(os.path.join(self.dir, n))
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+            self._n = 0
+
+    def count(self) -> int:
+        return len(self._mem) if self.dir is None else int(self._n)
+
+
 @dataclass
 class Proposal:
     tokens: np.ndarray  # exactly n ids (padded with the last real id when the copy is shorter)
@@ -1670,7 +2092,7 @@ class _Stat:
 
 class _Stream:
     __slots__ = ("ctx", "n", "h", "own", "prev", "cooldown", "pending", "own_ema", "prompt_tail", "offers",
-                 "out_len", "last_seen")
+                 "out_len", "last_seen", "q_keys", "q_ans", "q_pos", "q_run", "q_exp", "q_gram")
 
     def __init__(self, own_ema: float) -> None:
         self.ctx = np.empty(1024, dtype=np.int64)
@@ -1684,6 +2106,12 @@ class _Stream:
         self.prompt_tail = np.zeros(0, dtype=np.int64)
         self.offers = 0
         self.out_len = 0  # output ids appended through extend_stream
+        self.q_keys: List[str] = []  # question-hash keys of the prompt
+        self.q_ans: Optional[np.ndarray] = None  # the reply filed under one of them
+        self.q_pos = -1  # where in q_ans the stream's next id is expected (-1: not lined up)
+        self.q_run = 0  # ids the stream agreed with q_ans since it lined up
+        self.q_exp = 0  # where q_ans would be had the stream not diverged
+        self.q_gram: Optional[dict] = None
         self.last_seen = time.monotonic()
 
     def append(self, toks) -> None:
@@ -1717,11 +2145,12 @@ class _Stream:
 class RecallEngine:
     """Copy-draft decisions per stream on top of a RecallRecord. Single caller thread (the scheduler)."""
 
-    SOURCES = ("own", "record")
+    SOURCES = ("own", "record", "qhash")
 
     def __init__(self, record: RecallRecord, gamma: int, min_match: int = WINDOW, cooldown_rounds: int = 4,
                  probe_start: int = 16, probe_max: int = 4096, async_add: bool = True, prior_frac: float = 0.8,
-                 prior_weight: float = 2.0, decay: float = 0.98, min_n: int = 2, own_alpha: float = 0.25):
+                 prior_weight: float = 2.0, decay: float = 0.98, min_n: int = 2, own_alpha: float = 0.25,
+                 qhash: Optional[bool] = None, environ=None):
         self.record = record
         self.gamma = int(gamma)
         self.min_match = max(WINDOW, int(min_match))
@@ -1740,6 +2169,7 @@ class RecallEngine:
         self._own_global = 0.5 * self.gamma
         self.offers = 0
         self.probes = 0
+        self.tree_selects = 0  # propose_select rounds that weighed more than one record candidate (2.3.0)
         self.landed_tokens = 0
         self.unused = 0
         self.lookups = 0
@@ -1748,6 +2178,14 @@ class RecallEngine:
         self.gc_streams = 0
         self.last_clear = ""
         self._last_tick = 0.0
+        if qhash is None:
+            qhash = _env(ENV_NEW["qhash"], ENV_OLD["qhash"], "1", environ).strip().lower() in _TRUE
+        self._qs: Optional[_QStore] = None
+        if qhash:
+            self._qs = _QStore(record.dir if getattr(record, "backend", "") == "disk" else None,
+                               read_only=not record.writer)
+        self.qhash_hits = 0
+        self.qhash_realigns = 0
         self._q: Optional[queue.Queue] = None
         self._thread: Optional[threading.Thread] = None
         if async_add:
@@ -1771,6 +2209,10 @@ class RecallEngine:
                     self.record.credit(*payload)
                 elif kind == "stats":
                     self._dump_stats(payload)
+                elif kind == "refresh":
+                    self.record.refresh()
+                elif kind == "qput":
+                    self._qs.put(*payload)
                 elif kind == "clear":
                     self._do_clear()
             except Exception as e:  # never take the server down
@@ -1790,12 +2232,18 @@ class RecallEngine:
             self.record.credit(*payload)
         elif kind == "stats":
             self._dump_stats(payload)
+        elif kind == "refresh":
+            self.record.refresh()
+        elif kind == "qput":
+            self._qs.put(*payload)
         elif kind == "clear":
             self._do_clear()
 
     def _do_clear(self) -> None:
         try:
             self.record.clear()
+            if self._qs is not None:
+                self._qs.clear()
             for s in self._stats.values():
                 s.n = s.s = 0.0
                 s.offers = s.landed = 0
@@ -1825,6 +2273,8 @@ class RecallEngine:
         if now - self._last_tick < 2.0:
             return
         self._last_tick = now
+        if getattr(self.record, "shared", False):
+            self._submit("refresh", None)  # what the other processes sharing the directory appended
         if self.record.poll_clear_request():
             if self.record.writer:
                 self._submit("clear", None)
@@ -1843,6 +2293,12 @@ class RecallEngine:
         st = _Stream(self._own_global)
         st.prompt_tail = p[-64:].copy()
         st.append(p[-MAX_BACK:])
+        if self._qs is not None:
+            st.q_keys = _qhash_keys(p)
+            ans = self._qs.get(st.q_keys)
+            if ans is not None:
+                st.q_ans, st.q_pos, st.q_run = ans, 0, QHASH_START_L
+                self.qhash_hits += 1
         self._streams[rid] = st
         self.streams_begun += 1
         new = p[max(0, int(cached_len)):]
@@ -1854,6 +2310,8 @@ class RecallEngine:
         if st is not None and len(new_ids):
             st.append(new_ids)
             st.out_len += len(new_ids)
+            if st.q_ans is not None:
+                self._q_advance(st, new_ids)
             st.last_seen = time.monotonic()
 
     def stream_out_len(self, rid) -> int:
@@ -1868,6 +2326,8 @@ class RecallEngine:
         out = np.asarray(output_ids, dtype=np.int64).ravel()
         if out.size == 0:
             return
+        if self._qs is not None and st.q_keys and out.size >= QHASH_MIN_ANS:
+            self._submit("qput", (st.q_keys, out.copy()))
         seg = np.concatenate((st.prompt_tail, out))
         if seg.size >= WINDOW:
             self._submit("add", seg)
@@ -1880,6 +2340,55 @@ class RecallEngine:
         st = self._streams.get(rid)
         if st is not None:
             st.pending.clear()
+
+    # -- question hash ---------------------------------------------------------------------------
+    def _q_advance(self, st: "_Stream", toks) -> None:
+        """Follow the stream's output along the filed reply; after a divergence line up again on the last
+        QHASH_GRAM output ids (the occurrence nearest to where the reply would have been by now)."""
+        ans = st.q_ans
+        pos, run, exp = st.q_pos, st.q_run, st.q_exp
+        size = int(ans.size)
+        if isinstance(toks, np.ndarray):
+            toks = toks.tolist()
+        for t in toks:
+            if pos >= 0:
+                if pos < size and int(ans[pos]) == int(t):
+                    pos += 1
+                    run += 1
+                    continue
+                exp = pos + 1
+                pos = -1
+            else:
+                exp += 1
+        if pos < 0 and st.out_len >= QHASH_GRAM and st.n >= QHASH_GRAM:
+            g = st.q_gram
+            if g is None:
+                g = {}
+                al = ans.tolist()
+                for i in range(QHASH_GRAM, size):
+                    g.setdefault(tuple(al[i - QHASH_GRAM:i]), []).append(i)
+                st.q_gram = g
+            cands = g.get(tuple(int(x) for x in st.ctx[st.n - QHASH_GRAM:st.n]))
+            if cands:
+                pos = min(cands, key=lambda i: (abs(i - exp), i))
+                run = QHASH_GRAM
+                self.qhash_realigns += 1
+        st.q_pos, st.q_run, st.q_exp = pos, run, exp
+
+    def _qhash_candidate(self, st: "_Stream", n_tok: int):
+        ans = st.q_ans
+        if ans is None or st.q_pos < 0:
+            return None
+        cont = ans[st.q_pos:st.q_pos + n_tok]
+        real = int(cont.size)
+        if real < min(self.min_n, n_tok):
+            return None
+        if real < n_tok:
+            cont = np.concatenate((cont, np.full(n_tok - real, cont[-1], dtype=np.int64)))
+        else:
+            cont = cont.copy()
+        L = int(st.q_run)
+        return ("qhash", tier_of(L), L, cont, real, -1)
 
     # -- drafting --------------------------------------------------------------------------------
     def _expect(self, src: str, tier: int) -> float:
@@ -1947,11 +2456,101 @@ class RecallEngine:
         own = st.own_ema if own_ema is None else float(own_ema)
         best = None
         best_e = -1.0
-        for cand in (self._own_candidate(st, n_tok), self._record_candidate(st, n_tok)):
+        for cand in (self._qhash_candidate(st, n_tok), self._own_candidate(st, n_tok),
+                     self._record_candidate(st, n_tok)):
             if cand is None:
                 continue
             e = self._expect(cand[0], cand[1])
             if e > best_e:  # strict: the stream's own context (asked first) wins ties
+                best, best_e = cand, e
+        if best is None:
+            return None
+        src, tier, L, toks, real = best[:5]
+        pos = best[5] if len(best) > 5 else -1
+        probe = False
+        if best_e <= own:
+            left = self._probe_left[src] - 1
+            if left > 0:
+                self._probe_left[src] = left
+                return None
+            self._probe_left[src] = self._probe_iv[src]
+            probe = True
+            self.probes += 1
+        st.pending.append((src, tier, probe, real, own, pos))
+        st.offers += 1
+        st.last_seen = time.monotonic()
+        self.offers += 1
+        return Proposal(tokens=toks, source=src, tier=tier, match_len=L, probe=probe, real=real)
+
+    def candidates(self, rid, n: Optional[int] = None, k: int = 4) -> List[tuple]:
+        """Up to ``k`` distinct candidate copies for ``rid`` (the stream's own context first, then every place the
+        record continues it from, :meth:`RecallRecord.lookup_all`), each ``(src, tier, L, toks, real, pos)`` as
+        ``propose`` weighs them. Moves no gate state (tree rounds, 2.3.0)."""
+        st = self._streams.get(rid)
+        if st is None or st.n < WINDOW or st.cooldown > 0:
+            return []
+        n_tok = int(n or self.gamma)
+        out = []
+        qh = self._qhash_candidate(st, n_tok)
+        if qh is not None:
+            out.append(qh)
+        own = self._own_candidate(st, n_tok)
+        if own is not None:
+            out.append(own)
+        rec = self.record
+        if rec.end_pos - rec.base_pos >= WINDOW:
+            for p, L in rec.lookup_all(st.ctx[max(0, st.n - MAX_BACK):st.n], MAX_BACK, h=st.h):
+                if WINDOW <= L < self.min_match:
+                    continue
+                cont = rec.continuation(p, n_tok, min_n=min(self.min_n, n_tok))
+                if cont is None:
+                    continue
+                if L < WINDOW and cont.size > 2 * L:
+                    cont = cont[:2 * L]
+                real = int(cont.size)
+                if real < n_tok:
+                    cont = np.concatenate((cont, np.full(n_tok - real, cont[-1], dtype=np.int64)))
+                out.append(("record", tier_of(L), L, cont, real, p))
+        # One continuation that starts another counts once (the longer real part, then the longer match).
+        kept: List[tuple] = []
+        for c in out:
+            dup = False
+            for i, o in enumerate(kept):
+                m = min(c[4], o[4])
+                if np.array_equal(np.asarray(c[3][:m]), np.asarray(o[3][:m])):
+                    dup = True
+                    if (c[4], c[2]) > (o[4], o[2]) and c[0] == o[0]:
+                        kept[i] = c
+                    break
+            if not dup:
+                kept.append(c)
+            if len(kept) >= k:
+                break
+        return kept
+
+    def propose_select(self, rid, own_ema: Optional[float] = None, n: Optional[int] = None,
+                       k: int = 4) -> Optional[Proposal]:
+        """``propose`` over every distinct candidate (:meth:`candidates`) instead of the newest record hit alone: the
+        best expected landing wins (ties: the stream's own context, then the longer match). With one record candidate
+        it is ``propose`` exactly: same gate, probe schedule and accounting (chain-only heads under YEE_TREE)."""
+        st = self._streams.get(rid)
+        if st is None or st.n < WINDOW:
+            return None
+        if st.cooldown > 0:
+            st.cooldown -= 1
+            return None
+        n_tok = int(n or self.gamma)
+        own = st.own_ema if own_ema is None else float(own_ema)
+        cands = self.candidates(rid, n_tok, k)
+        rec_n = sum(1 for c in cands if c[0] == "record")
+        if rec_n:
+            self.lookups += 1
+        if rec_n > 1:
+            self.tree_selects += 1
+        best, best_e = None, -1.0
+        for cand in cands:
+            e = self._expect(cand[0], cand[1])
+            if e > best_e or (best is not None and e == best_e and cand[0] == best[0] == "record" and cand[2] > best[2]):
                 best, best_e = cand, e
         if best is None:
             return None
@@ -2019,11 +2618,15 @@ class RecallEngine:
                 "expect": round(self._expect(src, t), 4)}
         d = self.record.stats()
         d.update({
-            "gamma": self.gamma, "offers": self.offers, "probes": self.probes, "landed_tokens": self.landed_tokens,
+            "gamma": self.gamma, "offers": self.offers, "probes": self.probes, "tree_selects": self.tree_selects, "landed_tokens": self.landed_tokens,
             "unused": self.unused, "lookups": self.lookups, "own_rounds": self.rounds_own,
             "own_global_ema": round(self._own_global, 4), "active_streams": len(self._streams),
             "streams_begun": self.streams_begun, "gc_streams": self.gc_streams,
             "probe_interval": dict(self._probe_iv), "tiers": tiers,
+            "qhash": self._qs is not None, "qhash_hits": self.qhash_hits,
+            "qhash_realigns": self.qhash_realigns,
+            "qhash_puts": self._qs.puts if self._qs is not None else 0,
+            "qhash_entries": self._qs.count() if self._qs is not None else 0,
             "last_clear": self.last_clear, "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
         return d
@@ -2106,5 +2709,5 @@ def engine_from_env(gamma: int, identity: dict, environ=None) -> Optional[Recall
         _ENGINE = RecallEngine(
             rec, gamma,
             min_match=int(_env(ENV_NEW["min_match"], ENV_OLD["min_match"], str(WINDOW), env)),
-            prior_frac=float(_env(ENV_NEW["prior"], ENV_OLD["prior"], "0.8", env)))
+            prior_frac=float(_env(ENV_NEW["prior"], ENV_OLD["prior"], "0.8", env)), environ=env)
         return _ENGINE

@@ -1,4 +1,4 @@
-"""Source patches shipped inside Yee for the bases that are not Python hooks: TensorFold, cuteafd, mlx-serve.
+"""Source patches shipped inside Yee for the bases that are not Python hooks: TensorFold, cuteafd, mlx-serve, llama.cpp, the SGLang Mia images and (3.5.1) the strata engine.
 
 ``patches/MANIFEST.json`` lists every base: kind (``git-patch`` or ``source-drop``), baseline, the files with
 their sha256 (written at build time), variants and launch env. ``yee patch list | show | path | apply``.
@@ -6,11 +6,14 @@ their sha256 (written at build time), variants and launch env. ``yee patch list 
 apply, git-patch:   sha256 check -> ``git apply --reverse --check`` (already applied: say so, rc 0) ->
                     ``git apply --check`` -> ``git apply``; without git the same with ``patch -p1``.
 apply, source-drop: sha256 check -> DIR/<target> must exist -> files that differ are backed up to
-                    DIR/.yee-backup-<timestamp>/ and then overwritten.
+                    DIR/.yee-backup-<timestamp>/ and then overwritten. 3.5.0: a file entry may pin the file it
+                    replaces (``orig_sha256``; anything else is refused) and a base may list ``remove_after``
+                    globs under DIR (stale .pyc) that are removed after the copy.
 ``--check`` only checks and writes nothing. Exit codes: 0 ok, 1 check failed, 2 usage error.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -159,11 +162,25 @@ def _apply_source_drop(entry: dict, src: str, check: bool, root: str = ""):
         dest = os.path.join(src, *it["dest"].split("/"))
         if os.path.isfile(dest) and sha256_file(dest) == it["sha256"]:
             continue
+        # 3.5.0: an optional orig_sha256 pins the file this drop replaces; anything else is refused
+        want = str(it.get("orig_sha256") or "").lower()
+        if want:
+            have = sha256_file(dest) if os.path.isfile(dest) else ""
+            if have != want:
+                return RC_CHECK, ("refusing to replace %s: sha256 %s, the baseline (%s) needs %s"
+                                  % (it["dest"], have or "missing", entry.get("baseline") or "-", want[:16]))
         todo.append((resolve(it["file"], root), dest, it["dest"]))
+    # 3.5.0: an optional remove_after lists globs under the source tree (stale .pyc) removed after the copy
+    stale = sorted({p for g in entry.get("remove_after") or [] for p in glob.glob(os.path.join(src, *g.split("/")))})
     if not todo:
+        if stale and not check:
+            for p in stale:
+                os.remove(p)
+            return RC_OK, "already applied: every file matches; removed %d stale file(s)" % len(stale)
         return RC_OK, "already applied: every file matches"
     if check:
-        return RC_OK, "check ok: %d file(s) would be replaced: %s" % (len(todo), ", ".join(t[2] for t in todo))
+        return RC_OK, "check ok: %d file(s) would be replaced: %s%s" % (
+            len(todo), ", ".join(t[2] for t in todo), ("; %d stale file(s) would be removed" % len(stale)) if stale else "")
     backup = os.path.join(src, ".yee-backup-%s" % time.strftime("%Y%m%d-%H%M%S"))
     n = 0
     while os.path.exists(backup + ("-%d" % n if n else "")):
@@ -176,7 +193,10 @@ def _apply_source_drop(entry: dict, src: str, check: bool, root: str = ""):
             shutil.copy2(dest, b)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copyfile(srcfile, dest)
-    return RC_OK, "replaced %d file(s); originals in %s" % (len(todo), backup)
+    for p in stale:
+        os.remove(p)
+    return RC_OK, "replaced %d file(s); originals in %s%s" % (
+        len(todo), backup, ("; removed %d stale file(s)" % len(stale)) if stale else "")
 
 
 def apply(base: str, src: str, variant=None, check: bool = False, manifest=None, root: str = "", git=None):
@@ -238,7 +258,7 @@ def cmd_patch(args) -> int:
 
 
 def add_parser(sub) -> None:
-    sp = sub.add_parser("patch", help="source patches for TensorFold / cuteafd / mlx-serve")
+    sp = sub.add_parser("patch", help="source patches for TensorFold / cuteafd / mlx-serve / llama.cpp / SGLang Mia / strata")
     ps = sp.add_subparsers(dest="patch_cmd", required=True)
     ps.add_parser("list")
     for name in ("show", "path"):

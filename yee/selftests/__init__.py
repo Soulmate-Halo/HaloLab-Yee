@@ -9,7 +9,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ("test_recall_core.py", "test_recall_multilen.py", "test_heat.py", "test_density.py", "test_backends_equiv.py", "test_sglang_dspark.py",
          "test_sglang_heads.py", "test_vllm_hook.py", "test_vllm_heads.py", "test_tensorfold.py", "test_nongreedy.py",
-         "test_yee_pkg.py")
+         "test_yee_pkg.py", "test_tree.py", "test_recall_shared.py", "test_recall_qhash.py",
+         "test_defaults.py", "test_rank_agree.py")
 
 
 def run_all(verbose: bool = False) -> int:

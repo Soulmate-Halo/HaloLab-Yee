@@ -19,7 +19,7 @@
 - **container**：在真实镜像里检查过符号、签名和源码标记，钩子能装到真实类上，CPU 模拟测试通过；还没有起 GPU 服务实测。
 - **no-op / unsupported**：能识别出来，但不打补丁，服务原样运行。
 
-已验证过的版本：SGLang `0.0.0.dev0`（镜像 `dsv41-4x-spark:canary-roce-pd`）。其他版本先跑 `yee doctor`，结果为 FAIL 时钩子不会被安装。
+已验证过的版本：SGLang `0.0.0.dev0`（镜像 `dsv41-4x-spark`）。其他版本先跑 `yee doctor`，结果为 FAIL 时钩子不会被安装。
 
 ## 2. 两种装钩子的方式
 

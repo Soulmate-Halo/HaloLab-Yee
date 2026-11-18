@@ -1,6 +1,6 @@
 # 快速开始
 
-这一页给出从零到跑起来的完整步骤：装包、装钩子、配环境变量、验收、出问题怎么退。
+这一页给出从零到跑起来的完整步骤：装包、装钩子、验收、出问题怎么退。
 
 ## 0. 前置
 
@@ -8,12 +8,41 @@
 - 你有服务所在机器的 shell 权限，以及服务启动脚本的修改权限。
 - 知道服务用的是哪个 Python 解释器（`ps` 看启动命令，或进容器 `which python3`）。
 
-## 1. 装包
+## 1. 4.2.0 最短用法
+
+4.2.0 起所有加速开关默认打开，不用设任何环境变量。显式设 0 可以单独关掉某一项；设 `YEE=0`（或 `RECALL_ACCEL=0`）整个 Yee 都不加载。
+
+### Mia dsv41-4x-spark
+
+在 head 机上：
+
+```bash
+bash install.sh --check      # 只检查，不改任何东西
+bash install.sh --restart    # 装到 4 台机器，装完重启并做健康检查和冒烟
+```
+
+回退：
+
+```bash
+bash install.sh --uninstall --restart
+```
+
+`install.sh` 会自动找方案目录、4 台机器都装、在 env 文件末尾追加一段带标记的块（只写 `PYTHONPATH` 与 `YEE=1`）。其它机器上它自动走 `pip install` + `yee install-hook`。
+
+### 其它 Python 推理服务
+
+```bash
+pip install yee-4.2.0-py3-none-any.whl && python -m yee install-hook
+```
+
+然后照常启动服务，不需要再手动加环境变量。
+
+## 2. 装包
 
 在**服务实际使用的 Python 环境**里执行：
 
 ```bash
-pip install --no-deps yee-2.2.0-py3-none-any.whl
+pip install --no-deps yee-4.2.0-py3-none-any.whl
 ```
 
 只依赖 numpy。`--no-deps` 避免动服务环境里的其它包。
@@ -23,11 +52,12 @@ pip install --no-deps yee-2.2.0-py3-none-any.whl
 ```bash
 yee doctor
 yee selftest
+python -m yee config
 ```
 
-`doctor` 会列出各适配器需要的符号、签名、源码标记；有任何 FAIL 就**停下**，不要改服务源码，把输出交给人工处理。`selftest` 跑自带的测试组，不需要 pytest。
+`doctor` 会列出各适配器需要的符号、签名、源码标记；有任何 FAIL 就**停下**，不要改服务源码，把输出交给人工处理。`selftest` 跑自带的测试组，不需要 pytest。`config` 打印每个开关的生效值与来源（env / default / off）。
 
-## 2. 让 Yee 认出你的服务
+## 3. 让 Yee 认出你的服务
 
 两种方式，二选一：
 
@@ -45,7 +75,7 @@ yee auto
 
 支持矩阵见 [heads.md](heads.md)。
 
-## 3. 装钩子
+## 4. 装钩子
 
 ```bash
 yee auto --apply
@@ -60,12 +90,14 @@ cp $(python3 -c "import yee,os;print(os.path.dirname(yee.__file__))")/integratio
 export PYTHONPATH=/opt/yee:$PYTHONPATH   # 必须排在最前面；它会先执行 Mia 原来的 sitecustomize
 ```
 
-## 4. 加环境变量
+## 5. 环境变量
 
-按 `auto` 的输出给服务进程加环境变量。典型的一套：
+4.2.0 起不用设环境变量就能用。要改的时候看 [env.md](env.md) 的「4.2 自动默认值」一节，`python -m yee config` 会告诉你每个开关当前是 env 设的还是默认的。
+
+常用的一小批：
 
 ```bash
-export YEE=1
+export YEE=1                      # 整体开关；设 0 则整个 Yee 不加载
 export YEE_BACKEND=memory        # 想跨重启保留记录就用 disk
 export YEE_GIB=0.25              # 记录池大小，详见 env.md
 export YEE_TOKENIZER_DIR=/models/DeepSeek-V4.1-Flash   # 记录按 tokenizer 隔离
@@ -75,17 +107,27 @@ export VLLM_USE_V2_MODEL_RUNNER=1
 
 `RECALL_ACCEL_*` 和 `YEE_*` 等价，写哪个都行，`YEE_*` 优先。全部变量见 [env.md](env.md)。
 
-## 5. 重启并确认
+## 6. 重启并确认
 
-重启服务，确认日志里出现 `[recall] patched ...`（SGLang / vLLM）或 `[recall-accel] patched`。
+重启服务，确认日志里出现：
 
-每 30 秒还会打印一行统计：
+| 日志 | 含义 |
+|---|---|
+| `[yee] 4.2.0 defaults:` | 4.2 的默认值已生效 |
+| `[recall] patched ...`（SGLang / vLLM）或 `[recall-accel] patched` | 召回钩子已装上 |
+| `[recall] rank check on` | 各 TP rank 装的是同一版本 Yee，召回广播与专家预算启用 |
+| `[recall] steps=... used=... landed=...` | 召回统计，数字随请求增长 |
+| `[yee-eb] armed geometry ...` | 热专家验证预算已就绪 |
+
+每 30 秒还会打印一行召回统计：
 
 ```
 [recall] steps=... used=... landed=...
 ```
 
-## 6. 验收
+各 TP rank 版本不一致时会打印 `[recall] rank check off: ...` / `[yee-eb] rank check off: ...`，此时所有 rank 一起关闭相关功能，服务照常运行。
+
+## 7. 验收
 
 ```bash
 yee bench --url http://127.0.0.1:8000 --model <served-model-name> --rounds 2
@@ -98,7 +140,7 @@ yee bench --url http://127.0.0.1:8000 --model <served-model-name> --rounds 2
 
 任何一条不满足，就按 [troubleshooting.md](troubleshooting.md) 定位。
 
-## 7. 运行中的控制
+## 8. 运行中的控制
 
 ```bash
 yee status      # 查看记录状态
@@ -107,13 +149,15 @@ yee pause off   # 恢复
 yee clear       # 请求清空记录
 ```
 
-## 8. 回滚
+## 9. 回滚
 
 1. 只停复制：`yee pause on`。
 2. 关钩子：设 `YEE=0` 或 `YEE_ADAPTER=off`，重启。
 3. 彻底移除：`yee uninstall-hook && pip uninstall yee`（用 sitecustomize 模板的还要从 PYTHONPATH 里去掉模板目录），重启。
 
-## 9. 各基座的入口
+Mia dsv41-4x-spark 用一键脚本回退：`bash install.sh --uninstall --restart`。
+
+## 10. 各基座的入口
 
 - SGLang：[sglang.md](sglang.md)
 - vLLM：[vllm.md](vllm.md)

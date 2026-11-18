@@ -233,10 +233,11 @@ def second_writer_reads_only():
     if rc.fcntl is None:
         return "SKIP (no fcntl on this OS)"
     with TmpDir() as d:
-        r1 = rc.RecallRecord(d, IDENT, chunk_ids=1024)
+        # shared=False: the 3.5.x single writer (3.6.0 shares the directory by default, test_recall_shared.py)
+        r1 = rc.RecallRecord(d, IDENT, chunk_ids=1024, shared=False)
         s = rnd(500, 9)
         r1.add(s)
-        r2 = rc.RecallRecord(d, IDENT, chunk_ids=1024)
+        r2 = rc.RecallRecord(d, IDENT, chunk_ids=1024, shared=False)
         assert r1.writer and not r2.writer
         assert r2.add(rnd(500, 10)) == 0
         assert r2.lookup(s[100:140]) is not None

@@ -5,7 +5,7 @@ Remembers the token ids a server read and wrote and copies drafts from them into
 server runs (SGLang DSPARK / DFLASH / EAGLE / EAGLE3 / NEXTN-MTP / STANDALONE / UNO / NGRAM, vLLM V2 DSpark /
 DFlash / EAGLE / MTP); TensorFold has Recall built in and gets launch flags, record conversion and the
 recall-after-priced patch; cuteafd (DeepSeek V4.1 native serve) and mlx-serve (M5 DSpark) get source patches
-(``yee patch``). The target model verifies every copied id, so output is unchanged. ``yee auto`` picks the
+(``yee patch``). The target model verifies every copied id. ``yee auto`` picks the
 adapter, ``yee doc`` shows the built-in manual, ``yee bases`` the base x head table.
 
 Environment: every ``YEE_*`` variable is also visible as ``RECALL_ACCEL_*`` (copied below when that name is
@@ -56,7 +56,7 @@ from .core import (  # noqa: F401,E402
     tokenizer_identity,
 )
 
-__version__ = "2.2.0"
+__version__ = "4.2.0"
 
 __all__ = [
     "RecallRecord", "RecallEngine", "Proposal", "tokenizer_identity", "engine_from_env", "get_engine",

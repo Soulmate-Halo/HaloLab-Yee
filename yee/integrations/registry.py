@@ -34,7 +34,7 @@ ADAPTERS = {
         "FROZEN_KV_MTP": (None, "unsupported", "FrozenKVMTP draft() builds its own verify input (not hooked)"),
     },
     "vllm": {
-        "DSPARK": ("vllm_spec", "container", "DSparkSpeculator (inherits DFlashSpeculator.propose)"),
+        "DSPARK": ("vllm_spec", "container", "DSparkSpeculator (inherits DFlashSpeculator.propose); adaptive K (KAD) via vllm_d_recall 3.0.0"),
         "DFLASH": ("vllm_spec", "container", "DFlashSpeculator / DFlash2Speculator propose"),
         "EAGLE": ("vllm_spec", "container", "EagleSpeculator propose (V2 runner)"),
         "EAGLE3": ("vllm_spec", "container", "EagleSpeculator propose (V2 runner)"),
@@ -43,6 +43,52 @@ ADAPTERS = {
         "SUFFIX": (None, "unsupported", "no V2 speculator"),
     },
 }
+
+# Tree drafts (2.3.0, YEE_TREE): engine -> {ALGORITHM: (mode, reason)}.
+#   native  the head verifies several branches in one forward and recalled copies are branches (mlx-serve r598)
+#   select  the head verifies one chain: the best of every distinct candidate (own context, each record hit) fills it
+#   none    no tree drafts on this head (copies as in 2.2.0, or none)
+TREE = {
+    "sglang": {
+        "DSPARK": ("select", "DSpark verifies one block chain: propose_select picks among every record hit"),
+        "DFLASH": ("select", "DFlash verifies one block chain"),
+        "EAGLE": ("select", "topk=1 is a chain (select); a topk>1 tree keeps copies off: tree.merge_chains / "
+                            "to_sglang / from_sglang convert build_tree_kernel_efficient's arrays, the hook that "
+                            "would rewrite them in place is not written (needs a GPU check of the mask layouts)"),
+        "EAGLE3": ("select", "as EAGLE"),
+        "NEXTN": ("select", "as EAGLE"),
+        "MTP": ("select", "as EAGLE"),
+        "STANDALONE": ("select", "as EAGLE"),
+        "UNO": ("select", "as EAGLE"),
+        "NGRAM": ("select", "Yee swaps the whole n-gram block for a chain (chain_mask); its own BFS trie is not "
+                            "fed (tree.ngram_insert is the helper for a native trie hook)"),
+        "FROZEN_KV_MTP": ("none", "not hooked"),
+    },
+    "vllm": {
+        "DSPARK": ("select", "one block chain"),
+        "DFLASH": ("select", "one block chain"),
+        "EAGLE": ("select", "the V2 runner's propose returns a chain; a speculative_token_tree config is left "
+                            "alone (no hook point keeps its static tree slots consistent)"),
+        "EAGLE3": ("select", "as EAGLE"),
+        "MTP": ("select", "as EAGLE"),
+        "NGRAM": ("none", "not hooked"),
+        "SUFFIX": ("none", "not hooked"),
+    },
+}
+
+
+def tree_mode(engine, algorithm, topk=None) -> tuple:
+    """(mode, reason) of tree drafts for (engine, head). An SGLang EAGLE-family tree (topk > 1) is ``none``: its
+    copies stay off as in 2.2.0."""
+    from .. import tree as _tree
+
+    alg = norm_algorithm(algorithm)
+    if not _tree.tree_enabled():
+        return ("none", "YEE_TREE=0")
+    mode, reason = TREE.get(engine or "", {}).get(alg, ("none", "no adapter"))
+    if engine == "sglang" and alg in ("EAGLE", "EAGLE3", "NEXTN", "MTP", "STANDALONE", "UNO") and topk and int(topk) > 1:
+        return ("none", "EAGLE topk=%d tree: copies stay off (no in-place tree hook yet)" % int(topk))
+    return (mode, reason)
 ALIASES = {"NEXTN": "NEXTN", "EAGLE-3": "EAGLE3", "DEEPSEEK_MTP": "MTP", "QWEN3_NEXT_MTP": "MTP",
            "MIMO_MTP": "MTP", "ERNIE_MTP": "MTP", "GLM4_MOE_MTP": "MTP", "LONGCAT_FLASH_MTP": "MTP",
            "DFLASH2": "DFLASH", "NGRAM_GPU": "NGRAM"}
